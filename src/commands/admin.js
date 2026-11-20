@@ -27,30 +27,45 @@ function phoneDigits(jid) {
 // Verifica se o JID é o dono do bot
 export function checkIfOwner(sender, msg = null) {
   if (msg?.key?.fromMe) return true;
-  if (!sender) return false;
 
-  const ownerEnv = process.env.OWNER_NUMBER || '';
+  const ownerEnv = process.env.OWNER_NUMBER || process.env.BOT_NUMERO || '5571981756869,557181756869';
   const ownerList = ownerEnv.split(/[,;\s]+/).map(num => num.replace(/\D/g, '')).filter(Boolean);
-  
-  // Limpa o JID removendo sufixo de dispositivo (:1, :10) e domínio (@s.whatsapp.net, @lid)
-  const cleanSender = sender.split('@')[0].split(':')[0].replace(/\D/g, '');
-  if (!cleanSender) return false;
 
-  // LIDs não são números de telefone: sem heurística numérica aqui
-  if (!isPhoneJid(sender)) return false;
-
-  // Se não houver lista no .env, permite APENAS se a mensagem for enviada do próprio número do bot
   if (ownerList.length === 0) {
     return msg?.key?.fromMe === true;
   }
 
-  const sender8 = cleanSender.slice(-8);
+  const candidates = [
+    sender,
+    msg?.key?.participantPn,
+    msg?.key?.senderPn,
+    msg?.key?.participantAlt,
+    msg?.key?.remoteJidAlt,
+    msg?.key?.participant,
+    msg?.key?.remoteJid,
+    msg?.message?.extendedTextMessage?.contextInfo?.participant
+  ].filter(Boolean);
 
-  return ownerList.some(owner => {
-    if (cleanSender === owner) return true;
-    const owner8 = owner.slice(-8);
-    return owner8.length >= 8 && owner8 === sender8;
-  });
+  for (const cand of candidates) {
+    if (typeof cand !== 'string') continue;
+    // Pula se for estritamente um LID sem número de telefone associado
+    if (cand.endsWith('@lid') && !cand.includes('@s.whatsapp.net')) continue;
+
+    const cleanCand = cand.split('@')[0].split(':')[0].replace(/\D/g, '');
+    if (!cleanCand || cleanCand.length < 8) continue;
+
+    const cand8 = cleanCand.slice(-8);
+
+    for (const owner of ownerList) {
+      if (cleanCand === owner) return true;
+      const owner8 = owner.slice(-8);
+      if (owner8.length >= 8 && (cand8 === owner8 || cleanCand.endsWith(owner8) || owner.endsWith(cand8))) {
+        return true;
+      }
+    }
+  }
+
+  return false;
 }
 
 // Encontra o participant exato nos metadados, funcionando em grupos

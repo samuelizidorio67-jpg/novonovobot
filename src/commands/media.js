@@ -2,6 +2,7 @@ import { Sticker, StickerTypes } from 'wa-sticker-formatter';
 import { getDatabase } from '../database.js';
 import { downloadWhatsAppMedia, downloadYoutubeAudio, downloadYoutubeVideo, downloadTiktokVideo, downloadTiktokAudio, downloadInstagramVideo, downloadInstagramAudio } from '../utils/helpers.js';
 import { checkIfOwner } from './admin.js';
+import { findViewOnce, downloadViewOnceFile } from '../utils/viewOnceManager.js';
 import { aviso, erro, uso } from '../config/messages.js';
 import ffmpeg from 'fluent-ffmpeg';
 import ffmpegPath from 'ffmpeg-static';
@@ -444,95 +445,70 @@ export async function handleMediaCommands(sock, msg, command, args, sender) {
     case 'ver': {
       // Verificar se é o dono ou se está na lista de autorizados
       const isOwner = checkIfOwner(sender, msg);
-      const isAuthorized = db.autorizadosVer?.includes(sender);
+
+      const candidateSenders = [
+        sender,
+        msg?.key?.participantPn,
+        msg?.key?.senderPn,
+        msg?.key?.participantAlt,
+        msg?.key?.remoteJidAlt,
+        msg?.key?.participant,
+        msg?.key?.remoteJid
+      ].filter(Boolean);
+
+      const isAuthorized = candidateSenders.some(s => {
+        if (db.autorizadosVer?.includes(s)) return true;
+        const clean = s.split('@')[0].split(':')[0].replace(/\D/g, '');
+        if (!clean || clean.length < 8) return false;
+        const s8 = clean.slice(-8);
+        return db.autorizadosVer?.some(auth => {
+          const authClean = auth.split('@')[0].split(':')[0].replace(/\D/g, '');
+          return authClean && (authClean === clean || authClean.endsWith(s8) || clean.endsWith(authClean.slice(-8)));
+        });
+      });
 
       if (!isOwner && !isAuthorized) {
         return reply(aviso('Você não tem permissão para usar este comando.'));
       }
 
-      const contextInfo = msg.message?.extendedTextMessage?.contextInfo ||
-                          msg.message?.imageMessage?.contextInfo ||
-                          msg.message?.videoMessage?.contextInfo || {};
-
-      const quoted = contextInfo?.quotedMessage || 
-                     msg.message?.viewOnceMessageV2?.message || 
-                     msg.message?.viewOnceMessage?.message;
-
-      let viewOnceContent = null;
-      let mediaType = null;
-
-      if (quoted) {
-        if (quoted.viewOnceMessageV2?.message?.imageMessage) {
-          viewOnceContent = quoted.viewOnceMessageV2.message.imageMessage;
-          mediaType = 'image';
-        } else if (quoted.viewOnceMessageV2?.message?.videoMessage) {
-          viewOnceContent = quoted.viewOnceMessageV2.message.videoMessage;
-          mediaType = 'video';
-        } else if (quoted.viewOnceMessageV2Extension?.message?.imageMessage) {
-          viewOnceContent = quoted.viewOnceMessageV2Extension.message.imageMessage;
-          mediaType = 'image';
-        } else if (quoted.viewOnceMessageV2Extension?.message?.videoMessage) {
-          viewOnceContent = quoted.viewOnceMessageV2Extension.message.videoMessage;
-          mediaType = 'video';
-        } else if (quoted.viewOnceMessage?.message?.imageMessage) {
-          viewOnceContent = quoted.viewOnceMessage.message.imageMessage;
-          mediaType = 'image';
-        } else if (quoted.viewOnceMessage?.message?.videoMessage) {
-          viewOnceContent = quoted.viewOnceMessage.message.videoMessage;
-          mediaType = 'video';
-        } else if (quoted.imageMessage) {
-          viewOnceContent = quoted.imageMessage;
-          mediaType = 'image';
-        } else if (quoted.videoMessage) {
-          viewOnceContent = quoted.videoMessage;
-          mediaType = 'video';
-        }
+      // Desempacota contextInfo mesmo se estiver envolvido em ephemeralMessage
+      let innerMsg = msg.message;
+      while (innerMsg?.ephemeralMessage?.message || innerMsg?.documentWithCaptionMessage?.message) {
+        innerMsg = innerMsg.ephemeralMessage?.message || innerMsg.documentWithCaptionMessage?.message;
       }
 
-      if (!viewOnceContent) {
-        return reply(aviso('Responda a uma mensagem de visualização única (foto ou vídeo) com /ver.'));
+      const contextInfo = innerMsg?.extendedTextMessage?.contextInfo ||
+                          innerMsg?.imageMessage?.contextInfo ||
+                          innerMsg?.videoMessage?.contextInfo ||
+                          innerMsg?.audioMessage?.contextInfo ||
+                          msg.message?.extendedTextMessage?.contextInfo || {};
+
+      // Localiza a mídia de visualização única (cache, quoted ou última recebida)
+      const voData = findViewOnce(msg, from, contextInfo);
+
+      if (!voData || !voData.content) {
+        return reply(aviso('Nenhuma mídia de visualização única encontrada.\n💡 *Dica:* Responda à mídia com */ver* ou digite */ver* logo após ela ser enviada no grupo.'));
       }
 
-      const mediaKey = viewOnceContent.mediaKey;
-      const mediaKeyLength = typeof mediaKey === 'string'
-        ? mediaKey.trim().length
-        : (mediaKey?.byteLength ?? mediaKey?.length ?? 0);
-      if (!mediaKey || mediaKeyLength === 0) {
-        return reply(aviso('O WhatsApp não forneceu a chave necessária para abrir esta mídia. Peça para enviarem a foto ou o vídeo novamente.'));
-      }
-
-      await reply('⏳ Baixando mídia de visualização única, aguarde...');
+      await reply('⏳ Baixando e revelando mídia de visualização única, aguarde...');
 
       try {
-        const cleanQuoted = {};
-        if (mediaType === 'image') cleanQuoted.imageMessage = viewOnceContent;
-        if (mediaType === 'video') cleanQuoted.videoMessage = viewOnceContent;
+        const filePath = await downloadViewOnceFile(voData.mediaType, voData.content);
 
-        const stanzaId = contextInfo.stanzaId || msg.key.id;
-        const participant = contextInfo.participant || sender;
-
-        const simulatedMsg = {
-          key: {
-            remoteJid: from,
-            id: stanzaId,
-            participant: participant
-          },
-          message: cleanQuoted
-        };
-
-        const filePath = await downloadWhatsAppMedia(simulatedMsg, mediaType);
-
-        if (mediaType === 'image') {
-          await sock.sendMessage(from, { image: { url: filePath }, caption: '👁️ Mídia revelada!' }, { quoted: msg });
-        } else {
-          await sock.sendMessage(from, { video: { url: filePath }, caption: '👁️ Mídia revelada!' }, { quoted: msg });
+        const caption = '👁️ *Mídia revelada com sucesso!*';
+        if (voData.mediaType === 'image') {
+          await sock.sendMessage(from, { image: { url: filePath }, caption }, { quoted: msg });
+        } else if (voData.mediaType === 'video') {
+          await sock.sendMessage(from, { video: { url: filePath }, caption }, { quoted: msg });
+        } else if (voData.mediaType === 'audio') {
+          await sock.sendMessage(from, { audio: { url: filePath }, mimetype: 'audio/mp4', ptt: true }, { quoted: msg });
         }
 
         // Deleta arquivo temporário
         try { fs.unlinkSync(filePath); } catch (_) {}
       } catch (error) {
-        if (error?.message?.includes('Cannot derive from empty media key')) {
-          return reply(aviso('O WhatsApp não forneceu a chave necessária para abrir esta mídia. Peça para enviarem a foto ou o vídeo novamente.'));
+        if (error?.message === 'MISSING_MEDIA_KEY' || error?.message?.includes('Cannot derive from empty media key')) {
+          return reply(aviso('O WhatsApp não forneceu a chave de descriptografia para esta mídia (provavelmente enviada antes do bot ligar). Peça para reenviarem.'));
         }
         console.error('Erro ao revelar visualização única:', error);
         return reply(erro('Não consegui baixar e revelar a mídia.'));

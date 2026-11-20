@@ -2,6 +2,7 @@ import { handleIaCommand } from './commands/ia.js';
 import path from 'path';
 import fs from 'fs';
 import { jidNormalizedUser, USyncQuery, USyncUser } from '@whiskeysockets/baileys';
+import { recordIncomingViewOnce } from './utils/viewOnceManager.js';
 import { handleSocialCommands } from './commands/social.js';
 import { handleAdminCommands } from './commands/admin.js';
 import { handleMediaCommands } from './commands/media.js';
@@ -242,6 +243,7 @@ export async function handleMessages(rawSock, msg) {
   }
 
   cacheMessage(from, msg);
+  recordIncomingViewOnce(msg);
 
   // Extrair texto da mensagem desempacotando todos os wrappers do Baileys e WhatsApp Business
   let messageObj = msg.message;

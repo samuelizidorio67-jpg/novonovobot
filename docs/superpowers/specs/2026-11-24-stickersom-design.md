@@ -1,0 +1,13 @@
+# Design: `/stickersom` (Figurinha Sonora Nativa)
+
+- **Intenção e motivo:** Adicionar o comando `/stickersom` para criar figurinhas nativas do WhatsApp com áudio embutido (`audioStickerMessage`), mantendo `/sticker`, `/sticker2` e `/sticker3` intactos.
+- **Entradas aceitas:**
+  1. **Vídeo curto com áudio** (enviado na legenda ou respondido): extrai e limita a até **5 s** (padrão do WhatsApp para vídeo), gerando WebP animado (`512×512`, `<= 490 KB`) e áudio OGG/Opus (`audio/ogg; codecs=opus`). Se o vídeo não tiver faixa de áudio, retorna aviso claro orientando a usar `/sticker`.
+  2. **Imagem + áudio** (enviar imagem com `/stickersom` respondendo a um áudio, ou enviar/responder áudio respondendo a uma imagem): converte a imagem em WebP estático (`512×512`) e o áudio em OGG/Opus limitado a até **10 s** (padrão do WhatsApp para imagem estática).
+  3. **Segurança:** mídias de visualização única continuam bloqueadas (só `/ver`).
+- **Abordagem escolhida e trade-off:** Estender o `WAProto` do `@whiskeysockets/baileys` em memória (novo utilitário `src/utils/audioStickerProto.js`, sem editar `node_modules`) para suportar `Message.audioStickerMessage` (campo `134`), `StickerMessage.audioMessage` (campo `26`), `premium` (`24`) e `emojis` (`25`); preparar/enviar o WebP (`mediaType: 'sticker'`) e o OGG/Opus (`mediaType: 'audio'`, `ptt: false`) via `prepareWAMessageMedia` + `sock.waUploadToServer`, montar a `Message` final respeitando citações (`quoted`) e despachar pela fila do `QueueManager` via `sock.relayMessage` com `additionalAttributes: { mediatype: 'sticker' }`. Escolhida sobre a alternativa de enviar figurinha + áudio separados porque entrega a figurinha sonora nativa única do WhatsApp; o trade-off é depender de extensão do protobuf em runtime e precisar de validação final no WhatsApp conectado.
+- **Decisões de borda:**
+  - Vídeo acima de 15 s continua recusado (como no `/sticker`); para `/stickersom`, vídeo acima de 5 s é recortado para os primeiros 5 s e áudio citado acima de 10 s é recortado para os primeiros 10 s (com aviso no retorno se desejar ou mantendo simples).
+  - Comando `/stickersom` registrado em `src/messageHandler.js` (na fila pesada de mídia) e documentado em `src/config/menu.js`.
+  - Também atualizar `extractViewOnce`/`unwrapMessageContent` e `unsticker` para reconhecer `audioStickerMessage` caso receba uma figurinha sonora.
+- **Testes:** Testes automatizados unitários cobrindo encode/decode protobuf de `audioStickerMessage` (`134` + `26`), extração/conversão FFmpeg de vídeo com som → WebP + OGG/Opus, erro em vídeo mudo, e combinação imagem + áudio.

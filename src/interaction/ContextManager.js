@@ -173,16 +173,6 @@ export class ContextManager {
     const formattedHistory = conversationMemory.getFormattedHistory(from);
     const userFacts = this.getUserFacts(sender);
 
-    // Obtém personagem ativa configurada pelo usuário (padrão: 'nino')
-    let activeQuintuplet = 'nino';
-    try {
-      const u = getUser(sender);
-      if (u) {
-        const extra = typeof u.extra_data === 'string' ? JSON.parse(u.extra_data || '{}') : (u.extra_data || {});
-        if (extra.quintuplet) activeQuintuplet = extra.quintuplet;
-      }
-    } catch (_) {}
-
     return {
       chatJid: from,
       isGroup,
@@ -191,8 +181,7 @@ export class ContextManager {
       groupName: finalGroupName,
       timeContext,
       history: formattedHistory,
-      userFacts,
-      activeQuintuplet
+      userFacts
     };
   }
 }

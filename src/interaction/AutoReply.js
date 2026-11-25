@@ -1,16 +1,24 @@
 /**
  * AutoReply.js
- * Gerencia a lógica de respostas automáticas, menções, respostas a mensagens do bot
- * e diálogos diretos com as 5 irmãs Nakano no privado e grupos.
- * 
- * NOTA: Respostas espontâneas/intromissivas (ex: risadas aleatórias "kkk perdi tudo")
- * foram 100% removidas para evitar poluição e incômodo nos grupos.
+ * Gerencia respostas automáticas em grupos apenas quando o bot é mencionado
+ * ou respondido diretamente.
  */
 
+import { jidNormalizedUser } from '@whiskeysockets/baileys';
 import { conversationMemory } from './ConversationMemory.js';
 import { ContextManager } from './ContextManager.js';
 import { AIService } from './AIService.js';
-import { PersonalityManager, QUINTUPLETS } from './PersonalityManager.js';
+import { BOT_NAME } from '../config/messages.js';
+import { extractContextInfo } from '../utils/viewOnceManager.js';
+
+function normJid(jid) {
+  if (!jid || typeof jid !== 'string') return '';
+  try {
+    return jidNormalizedUser(jid).toLowerCase();
+  } catch (_) {
+    return jid.split(':')[0].toLowerCase();
+  }
+}
 
 export class AutoReply {
   /**
@@ -41,36 +49,42 @@ export class AutoReply {
       isBot: false
     });
 
-    // Identificar JID do Bot
+    // Identificar JIDs do Bot (PN e LID)
     const rawBotId = sock.user?.id || '';
     const botNum = rawBotId.split(':')[0].split('@')[0];
     const botJid = botNum ? `${botNum}@s.whatsapp.net` : '';
+    const botLid = normJid(sock.user?.lid || '');
 
     // Contexto de citação/menção
-    const contextInfo = msg.message?.extendedTextMessage?.contextInfo ||
-                        msg.message?.imageMessage?.contextInfo ||
-                        msg.message?.videoMessage?.contextInfo;
+    const contextInfo = extractContextInfo(msg);
+    const mentionedJids = (contextInfo?.mentionedJid || []).map(normJid).filter(Boolean);
+    const quotedParticipant = normJid(contextInfo?.participant || '');
 
-    const mentionedJids = contextInfo?.mentionedJid || [];
-    const quotedParticipant = contextInfo?.participant || '';
+    // 1. Menção direta ao bot (por tag @seiha ou @JID do bot — sem nomes de personagens)
+    const isMentionedByName = /@(seiha|whatsappautomationbot|automationbot)\b/i.test(text);
+    const isMentionedByJid = Boolean(
+      (botJid && mentionedJids.includes(normJid(botJid))) ||
+      (botLid && mentionedJids.includes(botLid))
+    );
+    const isMentioned = isMentionedByName || isMentionedByJid;
 
-    // 1. Verificação de Menção ao Bot ou a uma das 5 Irmãs Nakano
-    const isMentionedByName = /@(whatsappautomationbot|automationbot|quintupletsbot)/i.test(text);
-    const isMentionedByJid = botJid && mentionedJids.includes(botJid);
-    const isQuintupletMentioned = !!PersonalityManager.detectMentionedQuintuplet(text);
-    const isMentioned = isMentionedByName || isMentionedByJid || (isGroup && isQuintupletMentioned);
-
-    // 2. Verificação se estão respondendo (citando) uma mensagem do Bot
-    const isReplyingToBot = quotedParticipant && botJid && (
-      quotedParticipant === botJid ||
-      quotedParticipant.split('@')[0] === botNum
+    // 2. Resposta direta (citando) a uma mensagem do Bot
+    const isReplyingToBot = Boolean(
+      quotedParticipant && (
+        (botJid && quotedParticipant === normJid(botJid)) ||
+        (botLid && quotedParticipant === botLid) ||
+        (botNum && quotedParticipant.split('@')[0] === botNum)
+      )
     );
 
-    // O bot NÃO responderá automaticamente no privado (PV) a mensagens comuns como "oi" ou qualquer outro texto.
-    // Responderá apenas em grupos quando for mencionado ou citado diretamente.
+    // Responde apenas em grupos quando mencionado ou citado diretamente (nunca no PV nem por palavras soltas)
     if (isGroup && (isMentioned || isReplyingToBot)) {
-      // Remove a tag do bot do prompt para não poluir
-      const cleanPrompt = text.replace(/@(whatsappautomationbot|automationbot|quintupletsbot)/gi, '').trim() || 'Olá!';
+      let cleanPrompt = text
+        .replace(/@(seiha|whatsappautomationbot|automationbot)\b/gi, '');
+      if (botNum) {
+        cleanPrompt = cleanPrompt.replace(new RegExp(`@${botNum}\\b`, 'g'), '');
+      }
+      cleanPrompt = cleanPrompt.trim() || 'Olá!';
 
       await sock.sendPresenceUpdate?.('composing', from).catch(() => {});
 
@@ -80,15 +94,11 @@ export class AutoReply {
       if (replyText) {
         const sentMsg = await sock.sendMessage(from, { text: replyText }, { quoted: msg });
 
-        const detectedChar = PersonalityManager.detectMentionedQuintuplet(text) || context.activeQuintuplet || 'nino';
-        const charName = QUINTUPLETS[detectedChar]?.name || 'Nino Nakano';
-
-        // Salva a resposta do bot na memória da conversa com o nome da respectiva irmã
         if (sentMsg) {
           conversationMemory.addMessage(from, {
             id: sentMsg.key.id,
-            sender: botJid,
-            senderName: charName,
+            sender: botJid || rawBotId,
+            senderName: BOT_NAME,
             text: replyText,
             timestamp: Math.floor(Date.now() / 1000),
             isBot: true
@@ -98,7 +108,6 @@ export class AutoReply {
       }
     }
 
-    // Não responde mensagens aleatórias de PV ou de grupo
     return false;
   }
 }

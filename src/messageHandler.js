@@ -243,7 +243,7 @@ export async function handleMessages(rawSock, msg) {
   }
 
   cacheMessage(from, msg);
-  recordIncomingViewOnce(msg);
+  recordIncomingViewOnce(msg, from);
 
   // Extrair texto da mensagem desempacotando todos os wrappers do Baileys e WhatsApp Business
   let messageObj = msg.message;
@@ -479,9 +479,13 @@ export async function handleMessages(rawSock, msg) {
     else if (['ban', 'adm', 'remover', 'antidel'].includes(command)) {
       await handleAdminCommands(sock, msg, command, args, sender, mentioned);
     } 
+    // Comando /ver (execução imediata, sem aguardar downloads na fila pesada)
+    else if (command === 'ver') {
+      await handleMediaCommands(sock, msg, command, args, sender, from);
+    }
     // Comandos de Mídia (Downloads/Stickers)
-    else if (['sticker', 'sticker2', 'sticker3', 'unsticker', 'ver', 'play', 'video', 'tiktok', 'ttvideo', 'tiktokaudio', 'ttplay', 'ig', 'insta', 'igvideo', 'igaudio', 'instavideo', 'instaaudio', 'igplay'].includes(command)) {
-      await queueManager.enqueueHeavyCommand(from, command, () => handleMediaCommands(sock, msg, command, args, sender));
+    else if (['sticker', 'sticker2', 'sticker3', 'unsticker', 'play', 'video', 'tiktok', 'ttvideo', 'tiktokaudio', 'ttplay', 'ig', 'insta', 'igvideo', 'igaudio', 'instavideo', 'instaaudio', 'igplay'].includes(command)) {
+      await queueManager.enqueueHeavyCommand(from, command, () => handleMediaCommands(sock, msg, command, args, sender, from));
     }
     // 👥 Administração Adicional
     else if (command === 'kick') await handleKickCommand(sock, msg, args, sender, mentioned);

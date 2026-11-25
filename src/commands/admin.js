@@ -2,7 +2,26 @@ import { getDatabase, updateDatabase } from '../database.js';
 import { jidNormalizedUser } from '@whiskeysockets/baileys';
 import dotenv from 'dotenv';
 import { grupoApenas, adminOuDonoApenas, donoApenas, botPrecisaAdmin, marcaAlguem, alvoNaoEncontrado, aviso, erro, uso, estado } from '../config/messages.js';
+import { extractContextInfo } from '../utils/viewOnceManager.js';
 dotenv.config();
+
+const groupMetaCache = new Map();
+const GROUP_META_TTL_MS = 60 * 1000;
+
+async function getGroupMetadataCached(sock, groupJid) {
+  if (!sock?.groupMetadata || !groupJid?.endsWith('@g.us')) return null;
+  const cached = groupMetaCache.get(groupJid);
+  if (cached && Date.now() - cached.at < GROUP_META_TTL_MS) {
+    return cached.data;
+  }
+  try {
+    const data = await sock.groupMetadata(groupJid);
+    groupMetaCache.set(groupJid, { at: Date.now(), data });
+    return data;
+  } catch (_) {
+    return null;
+  }
+}
 
 // Normaliza um JID para comparação (minúsculo, sem sufixo de dispositivo)
 function normJid(jid) {
@@ -24,6 +43,14 @@ function phoneDigits(jid) {
   return String(jid).split('@')[0].split(':')[0].replace(/\D/g, '');
 }
 
+function phoneDigitsMatch(a, b) {
+  if (!isPhoneJid(a) || !isPhoneJid(b)) return false;
+  const da = phoneDigits(a);
+  const db = phoneDigits(b);
+  if (!da || !db || da.length < 8 || db.length < 8) return false;
+  return da === db || da.endsWith(db.slice(-8)) || db.endsWith(da.slice(-8));
+}
+
 // Verifica se o JID é o dono do bot
 export function checkIfOwner(sender, msg = null) {
   if (msg?.key?.fromMe) return true;
@@ -35,6 +62,9 @@ export function checkIfOwner(sender, msg = null) {
     return msg?.key?.fromMe === true;
   }
 
+  const rawRemote = msg?.key?.remoteJid;
+  const isGroup = typeof rawRemote === 'string' && rawRemote.endsWith('@g.us');
+
   const candidates = [
     sender,
     msg?.key?.participantPn,
@@ -42,16 +72,13 @@ export function checkIfOwner(sender, msg = null) {
     msg?.key?.participantAlt,
     msg?.key?.remoteJidAlt,
     msg?.key?.participant,
-    msg?.key?.remoteJid,
-    msg?.message?.extendedTextMessage?.contextInfo?.participant
+    !isGroup ? rawRemote : null
   ].filter(Boolean);
 
   for (const cand of candidates) {
-    if (typeof cand !== 'string') continue;
-    // Pula se for estritamente um LID sem número de telefone associado
-    if (cand.endsWith('@lid') && !cand.includes('@s.whatsapp.net')) continue;
+    if (!isPhoneJid(cand)) continue;
 
-    const cleanCand = cand.split('@')[0].split(':')[0].replace(/\D/g, '');
+    const cleanCand = phoneDigits(cand);
     if (!cleanCand || cleanCand.length < 8) continue;
 
     const cand8 = cleanCand.slice(-8);
@@ -66,6 +93,64 @@ export function checkIfOwner(sender, msg = null) {
   }
 
   return false;
+}
+
+// Coleta todos os identificadores válidos do remetente (PN + LID via metadados de grupo se necessário)
+export async function resolveSenderCandidates(sock, from, sender, msg = null) {
+  const rawRemote = msg?.key?.remoteJid;
+  const isGroup = (typeof from === 'string' && from.endsWith('@g.us')) ||
+                  (typeof rawRemote === 'string' && rawRemote.endsWith('@g.us'));
+
+  const base = [
+    sender,
+    msg?.key?.participantPn,
+    msg?.key?.senderPn,
+    msg?.key?.participantAlt,
+    !isGroup ? msg?.key?.remoteJidAlt : null,
+    msg?.key?.participant,
+    !isGroup && !msg?.key?.fromMe ? rawRemote : null
+  ].filter(Boolean);
+
+  if (isGroup && !base.some(isPhoneJid)) {
+    const groupJid = (typeof from === 'string' && from.endsWith('@g.us')) ? from : rawRemote;
+    const meta = await getGroupMetadataCached(sock, groupJid);
+    const p = findParticipant(meta?.participants, sender || msg?.key?.participant);
+    if (p) {
+      if (p.jid) base.push(p.jid);
+      if (p.lid) base.push(p.lid);
+      if (p.id) base.push(p.id);
+    }
+  }
+
+  const out = [];
+  for (const c of base) {
+    if (typeof c !== 'string' || c.endsWith('@g.us')) continue;
+    const n = normJid(c);
+    if (n && !out.includes(n)) out.push(n);
+    if (!out.includes(c)) out.push(c);
+  }
+  return out;
+}
+
+// Verifica se algum dos identificadores do remetente está autorizado para /ver
+export function isAuthorizedForVer(autorizadosVer = [], candidateSenders = []) {
+  if (!Array.isArray(autorizadosVer) || autorizadosVer.length === 0) return false;
+  if (!Array.isArray(candidateSenders) || candidateSenders.length === 0) return false;
+
+  const normAuth = autorizadosVer.map(normJid).filter(Boolean);
+
+  return candidateSenders.some((cand) => {
+    if (typeof cand !== 'string' || cand.endsWith('@g.us')) return false;
+    const normCand = normJid(cand);
+    if (!normCand) return false;
+
+    if (autorizadosVer.includes(cand) || normAuth.includes(normCand)) return true;
+
+    if (isPhoneJid(cand)) {
+      return autorizadosVer.some((auth) => phoneDigitsMatch(cand, auth));
+    }
+    return false;
+  });
 }
 
 // Encontra o participant exato nos metadados, funcionando em grupos
@@ -161,7 +246,11 @@ export async function handleAdminCommands(sock, msg, command, args, sender, ment
     await sock.sendMessage(from, { text, mentions }, { quoted: msg });
   };
 
-  const isSenderOwner = checkIfOwner(sender, msg);
+  let isSenderOwner = checkIfOwner(sender, msg);
+  if (!isSenderOwner && isGroup) {
+    const senderCandidates = await resolveSenderCandidates(sock, from, sender, msg);
+    isSenderOwner = senderCandidates.some((c) => isPhoneJid(c) && checkIfOwner(c));
+  }
 
   switch (command) {
     case 'ban': {
@@ -232,19 +321,28 @@ export async function handleAdminCommands(sock, msg, command, args, sender, ment
         return reply(donoApenas());
       }
 
-      let target = mentioned[0];
-      if (!target && msg.message?.extendedTextMessage?.contextInfo?.participant) {
-        target = msg.message.extendedTextMessage.contextInfo.participant;
-      }
+      const ctx = extractContextInfo(msg);
+      let target = mentioned[0] || ctx?.participant;
 
       if (!target) {
         return reply(marcaAlguem());
       }
 
+      const targetJids = [normJid(target)].filter(Boolean);
+      if (isGroup) {
+        const meta = await getGroupMetadataCached(sock, from);
+        const participant = findParticipant(meta?.participants, target);
+        if (participant?.jid) targetJids.unshift(normJid(participant.jid));
+        if (participant?.lid) targetJids.push(normJid(participant.lid));
+      }
+      const primaryTarget = targetJids.find(isPhoneJid) || targetJids[0] || target;
+
       let jaAutorizado = false;
-      updateDatabase((db) => {
-        if (!db.autorizadosVer.includes(target)) {
-          db.autorizadosVer.push(target);
+      await updateDatabase((db) => {
+        if (!Array.isArray(db.autorizadosVer)) db.autorizadosVer = [];
+        const already = isAuthorizedForVer(db.autorizadosVer, targetJids);
+        if (!already) {
+          db.autorizadosVer.push(primaryTarget);
         } else {
           jaAutorizado = true;
         }
@@ -262,22 +360,33 @@ export async function handleAdminCommands(sock, msg, command, args, sender, ment
         return reply(donoApenas());
       }
 
-      let target = mentioned[0];
-      if (!target && msg.message?.extendedTextMessage?.contextInfo?.participant) {
-        target = msg.message.extendedTextMessage.contextInfo.participant;
-      }
+      const ctx = extractContextInfo(msg);
+      let target = mentioned[0] || ctx?.participant;
 
       if (!target) {
         return reply(marcaAlguem());
       }
 
+      const targetAliases = [normJid(target)].filter(Boolean);
+      if (isGroup) {
+        const meta = await getGroupMetadataCached(sock, from);
+        const participant = findParticipant(meta?.participants, target);
+        if (participant?.id) targetAliases.push(normJid(participant.id));
+        if (participant?.jid) targetAliases.push(normJid(participant.jid));
+        if (participant?.lid) targetAliases.push(normJid(participant.lid));
+      }
+
       let removido = false;
-      updateDatabase((db) => {
-        const index = db.autorizadosVer.indexOf(target);
-        if (index !== -1) {
-          db.autorizadosVer.splice(index, 1);
-          removido = true;
-        }
+      await updateDatabase((db) => {
+        if (!Array.isArray(db.autorizadosVer)) return;
+        const antes = db.autorizadosVer.length;
+        db.autorizadosVer = db.autorizadosVer.filter((auth) => {
+          const normAuth = normJid(auth);
+          if (targetAliases.includes(normAuth)) return false;
+          if (targetAliases.some((t) => phoneDigitsMatch(t, auth))) return false;
+          return true;
+        });
+        removido = db.autorizadosVer.length < antes;
       });
 
       if (!removido) {

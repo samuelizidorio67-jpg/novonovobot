@@ -1,8 +1,8 @@
 import { Sticker, StickerTypes } from 'wa-sticker-formatter';
 import { getDatabase } from '../database.js';
 import { downloadWhatsAppMedia, downloadYoutubeAudio, downloadYoutubeVideo, downloadTiktokVideo, downloadTiktokAudio, downloadInstagramVideo, downloadInstagramAudio } from '../utils/helpers.js';
-import { checkIfOwner } from './admin.js';
-import { findViewOnce, downloadViewOnceFile } from '../utils/viewOnceManager.js';
+import { checkIfOwner, isAuthorizedForVer, isPhoneJid, resolveSenderCandidates } from './admin.js';
+import { findViewOnce, downloadViewOnceFile, extractContextInfo, extractViewOnce } from '../utils/viewOnceManager.js';
 import { aviso, erro, uso } from '../config/messages.js';
 import ffmpeg from 'fluent-ffmpeg';
 import ffmpegPath from 'ffmpeg-static';
@@ -112,16 +112,7 @@ function convertWebpToMp4(inputPath) {
 
 // Detecta se a mensagem citada é de visualização única (qualquer wrapper)
 function isViewOnceQuoted(quoted) {
-  if (!quoted || typeof quoted !== 'object') return false;
-  if (quoted.viewOnceMessage || quoted.viewOnceMessageV2 || quoted.viewOnceMessageV2Extension) return true;
-  // Wrapper aninhado um nível (ex: ephemeralMessage envolvendo view-once)
-  for (const key of ['ephemeralMessage', 'viewOnceMessage', 'viewOnceMessageV2', 'viewOnceMessageV2Extension', 'documentWithCaptionMessage']) {
-    const inner = quoted[key]?.message || quoted[key];
-    if (inner && typeof inner === 'object' && (inner.viewOnceMessage || inner.viewOnceMessageV2 || inner.viewOnceMessageV2Extension)) {
-      return true;
-    }
-  }
-  return false;
+  return Boolean(extractViewOnce(quoted));
 }
 
 // Extrai imagem (direta ou citada) para figurinha.
@@ -257,8 +248,8 @@ export async function sendAudioCompat(sock, from, filePath, title, quotedMsg) {
   }
 }
 
-export async function handleMediaCommands(sock, msg, command, args, sender) {
-  const from = msg.key.remoteJid;
+export async function handleMediaCommands(sock, msg, command, args, sender, resolvedFrom = null) {
+  const from = resolvedFrom || msg.key.remoteJid;
   const reply = async (text) => {
     await sock.sendMessage(from, { text }, { quoted: msg });
   };
@@ -443,57 +434,36 @@ export async function handleMediaCommands(sock, msg, command, args, sender) {
     }
 
     case 'ver': {
-      // Verificar se é o dono ou se está na lista de autorizados
-      const isOwner = checkIfOwner(sender, msg);
-
-      const candidateSenders = [
-        sender,
-        msg?.key?.participantPn,
-        msg?.key?.senderPn,
-        msg?.key?.participantAlt,
-        msg?.key?.remoteJidAlt,
-        msg?.key?.participant,
-        msg?.key?.remoteJid
-      ].filter(Boolean);
-
-      const isAuthorized = candidateSenders.some(s => {
-        if (db.autorizadosVer?.includes(s)) return true;
-        const clean = s.split('@')[0].split(':')[0].replace(/\D/g, '');
-        if (!clean || clean.length < 8) return false;
-        const s8 = clean.slice(-8);
-        return db.autorizadosVer?.some(auth => {
-          const authClean = auth.split('@')[0].split(':')[0].replace(/\D/g, '');
-          return authClean && (authClean === clean || authClean.endsWith(s8) || clean.endsWith(authClean.slice(-8)));
-        });
-      });
+      // Verificar se é o dono ou se está na lista de autorizados (cobre PN + LID via metadados)
+      const candidateSenders = await resolveSenderCandidates(sock, from, sender, msg);
+      const isOwner = checkIfOwner(sender, msg) || candidateSenders.some((c) => isPhoneJid(c) && checkIfOwner(c));
+      const isAuthorized = isAuthorizedForVer(db.autorizadosVer, candidateSenders);
 
       if (!isOwner && !isAuthorized) {
         return reply(aviso('Você não tem permissão para usar este comando.'));
       }
 
-      // Desempacota contextInfo mesmo se estiver envolvido em ephemeralMessage
-      let innerMsg = msg.message;
-      while (innerMsg?.ephemeralMessage?.message || innerMsg?.documentWithCaptionMessage?.message) {
-        innerMsg = innerMsg.ephemeralMessage?.message || innerMsg.documentWithCaptionMessage?.message;
-      }
-
-      const contextInfo = innerMsg?.extendedTextMessage?.contextInfo ||
-                          innerMsg?.imageMessage?.contextInfo ||
-                          innerMsg?.videoMessage?.contextInfo ||
-                          innerMsg?.audioMessage?.contextInfo ||
-                          msg.message?.extendedTextMessage?.contextInfo || {};
+      const contextInfo = extractContextInfo(msg);
 
       // Localiza a mídia de visualização única (cache, quoted ou última recebida)
-      const voData = findViewOnce(msg, from, contextInfo);
+      const voData = findViewOnce(msg, [from, msg?.key?.remoteJid], contextInfo);
+
+      if (voData?.missingKey) {
+        if (voData.unavailable) {
+          return reply(aviso('O WhatsApp não entregou essa mídia de visualização única para o dispositivo conectado do bot (unavailable). Aguarde alguns segundos ou peça para reenviarem.'));
+        }
+        return reply(aviso('O WhatsApp não forneceu a chave de descriptografia para esta mídia (provavelmente enviada antes do bot ligar ou já expirada). Peça para reenviarem.'));
+      }
 
       if (!voData || !voData.content) {
-        return reply(aviso('Nenhuma mídia de visualização única encontrada.\n💡 *Dica:* Responda à mídia com */ver* ou digite */ver* logo após ela ser enviada no grupo.'));
+        return reply(aviso('Nenhuma mídia de visualização única encontrada.\n💡 *Dica:* Responda à mídia com */ver* ou digite */ver* logo após ela ser enviada no chat.'));
       }
 
       await reply('⏳ Baixando e revelando mídia de visualização única, aguarde...');
 
+      let filePath = null;
       try {
-        const filePath = await downloadViewOnceFile(voData.mediaType, voData.content);
+        filePath = await downloadViewOnceFile(voData.mediaType, voData.content, { sock, voData });
 
         const caption = '👁️ *Mídia revelada com sucesso!*';
         if (voData.mediaType === 'image') {
@@ -501,17 +471,40 @@ export async function handleMediaCommands(sock, msg, command, args, sender) {
         } else if (voData.mediaType === 'video') {
           await sock.sendMessage(from, { video: { url: filePath }, caption }, { quoted: msg });
         } else if (voData.mediaType === 'audio') {
-          await sock.sendMessage(from, { audio: { url: filePath }, mimetype: 'audio/mp4', ptt: true }, { quoted: msg });
+          if (filePath.endsWith('.ogg')) {
+            await sock.sendMessage(from, {
+              audio: { url: filePath },
+              mimetype: voData.content.mimetype || 'audio/ogg; codecs=opus',
+              ptt: voData.content.ptt !== false
+            }, { quoted: msg });
+          } else {
+            await sendAudioCompat(sock, from, filePath, 'audio-ver', msg);
+          }
+        } else if (voData.mediaType === 'document') {
+          await sock.sendMessage(from, {
+            document: { url: filePath },
+            mimetype: voData.content.mimetype || 'application/octet-stream',
+            fileName: voData.content.fileName || 'arquivo'
+          }, { quoted: msg });
         }
-
-        // Deleta arquivo temporário
-        try { fs.unlinkSync(filePath); } catch (_) {}
       } catch (error) {
         if (error?.message === 'MISSING_MEDIA_KEY' || error?.message?.includes('Cannot derive from empty media key')) {
           return reply(aviso('O WhatsApp não forneceu a chave de descriptografia para esta mídia (provavelmente enviada antes do bot ligar). Peça para reenviarem.'));
         }
+        if (error?.message === 'MISSING_MEDIA_URL' || error?.message === 'EMPTY_MEDIA_STREAM') {
+          return reply(aviso('A mídia de visualização única veio sem endereço válido ou vazia (provavelmente expirada). Peça para reenviarem.'));
+        }
+        const status = error?.response?.status;
+        if (status === 404 || status === 410 || status === 403) {
+          return reply(aviso('Esta mídia de visualização única já expirou nos servidores do WhatsApp (HTTP ' + status + '). Peça para reenviarem.'));
+        }
         console.error('Erro ao revelar visualização única:', error);
-        return reply(erro('Não consegui baixar e revelar a mídia.'));
+        const detail = error?.message ? ` (${error.message.slice(0, 120)})` : '';
+        return reply(erro(`Não consegui baixar e revelar a mídia${detail}.`));
+      } finally {
+        if (filePath && fs.existsSync(filePath)) {
+          try { fs.unlinkSync(filePath); } catch (_) {}
+        }
       }
       break;
     }

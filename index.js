@@ -9,6 +9,7 @@ import { loadDatabase } from './src/database.js';
 import { initSqlite } from './src/database/sqlite.js';
 import { ensureDataDir, SESSION_DIR, IS_PERSISTENT, DATA_DIR } from './src/config/paths.js';
 import { criarCacheDeTentativas, instalarFiltroDeRuidoDeSessao, criarRegistradorDeFalhas } from './src/utils/sessionTools.js';
+import { recordIncomingViewOnce, recordUnavailableViewOnce } from './src/utils/viewOnceManager.js';
 import { handleMessages } from './src/messageHandler.js';
 import { startReminderScheduler } from './src/commands/seiha/lembrete.js';
 import queueManager from './src/queue/QueueManager.js';
@@ -179,8 +180,13 @@ async function startBot() {
       for (const msg of m.messages) {
         guardarMensagem(msg.key, msg.message);
 
-        // Sem conteúdo = não foi possível descriptografar (Bad MAC).
+        // Sem conteúdo: pode ser view_once indisponível para dispositivo conectado ou Bad MAC.
         if (!msg.message) {
+          if (msg.key?.isViewOnce) {
+            recordUnavailableViewOnce(msg);
+            console.warn(`⚠️ [ver] Mídia de visualização única indisponível para o dispositivo conectado (${msg.key.remoteJid}).`);
+            continue;
+          }
           registrarFalhaDeDescriptografia(msg.key);
           continue;
         }
@@ -190,6 +196,15 @@ async function startBot() {
         } catch (err) {
           console.error('Erro ao processar mensagem no loop principal:', err);
         }
+      }
+    }
+  });
+
+  // Captura atualizações de mensagens (ex: reenvio/descriptografia tardia de visualização única)
+  sock.ev.on('messages.update', (updates) => {
+    for (const item of updates || []) {
+      if (item?.update?.message && item?.key) {
+        recordIncomingViewOnce({ key: item.key, message: item.update.message });
       }
     }
   });

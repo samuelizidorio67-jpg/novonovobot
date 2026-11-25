@@ -156,7 +156,7 @@ export const CATEGORIAS = [
       ['enquete <título|opção1|opção2>', 'Criar uma enquete votável'],
       ['ticket <motivo>', 'Abrir um chamado com a administração'],
       ['antidel <on|off>', 'Apagar mensagens deletadas (dono)'],
-      ['adm @pessoa', 'Autorizar alguém a usar o /ver (dono)'],
+      ['adm @pessoa', 'Autorizar alguém a usar o {prefixo}ver (dono)'],
       ['remover @pessoa', 'Tirar essa autorização (dono)'],
     ],
   },
@@ -230,7 +230,8 @@ export function buildMenuCategoria(categoria, { prefixo = '/' } = {}) {
 
   const linhas = [`${categoria.emoji} *${categoria.titulo}*`, ''];
   for (const [usoCmd, descricao] of categoria.comandos) {
-    linhas.push(`${prefixo}${usoCmd} — ${descricao}`);
+    const descFormatada = String(descricao).replace(/\{prefixo\}/g, prefixo);
+    linhas.push(`${prefixo}${usoCmd} — ${descFormatada}`);
   }
   return linhas.join('\n');
 }

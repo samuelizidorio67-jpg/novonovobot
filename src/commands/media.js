@@ -384,6 +384,7 @@ export async function processSoundStickerSources(
 
   await reply('⏳ Criando sua figurinha com som, aguarde...');
 
+  const ephemeralExpiration = Number(extractContextInfo(msg)?.expiration) || undefined;
   const tempFiles = [];
   try {
     if (sources.mode === 'video') {
@@ -409,7 +410,8 @@ export async function processSoundStickerSources(
         audioBuffer,
         durationSeconds,
         isAnimated: true,
-        quoted: msg
+        quoted: msg,
+        ephemeralExpiration
       });
       return;
     }
@@ -437,7 +439,8 @@ export async function processSoundStickerSources(
         audioBuffer,
         durationSeconds,
         isAnimated: false,
-        quoted: msg
+        quoted: msg,
+        ephemeralExpiration
       });
     }
   } catch (error) {

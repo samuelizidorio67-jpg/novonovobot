@@ -307,22 +307,107 @@ export function unwrapAudioStickerMessage(messageObj) {
 }
 
 /**
+ * Lê dimensões e flag de animação de um buffer RIFF/WEBP quando os chunks
+ * estiverem presentes; caso contrário usa dimensões padrão 512x512.
+ * @param {Buffer} webpBuffer
+ * @returns {{ width: number, height: number, isAnimated: boolean | null }}
+ */
+export function parseWebpMetadata(webpBuffer) {
+  const fallback = { width: 512, height: 512, isAnimated: null };
+  if (!Buffer.isBuffer(webpBuffer) || webpBuffer.length < 20) {
+    return fallback;
+  }
+  if (
+    webpBuffer.subarray(0, 4).toString('ascii') !== 'RIFF' ||
+    webpBuffer.subarray(8, 12).toString('ascii') !== 'WEBP'
+  ) {
+    return fallback;
+  }
+
+  let width = null;
+  let height = null;
+  let isAnimated = null;
+  let offset = 12;
+
+  while (offset + 8 <= webpBuffer.length) {
+    const fourcc = webpBuffer.subarray(offset, offset + 4).toString('ascii');
+    const chunkSize = webpBuffer.readUInt32LE(offset + 4);
+    const payloadOffset = offset + 8;
+
+    if (payloadOffset + chunkSize > webpBuffer.length) break;
+
+    if (fourcc === 'VP8X' && chunkSize >= 10) {
+      const flags = webpBuffer[payloadOffset];
+      isAnimated = (flags & 0x02) !== 0;
+      width = 1 + (webpBuffer[payloadOffset + 4] | (webpBuffer[payloadOffset + 5] << 8) | (webpBuffer[payloadOffset + 6] << 16));
+      height = 1 + (webpBuffer[payloadOffset + 7] | (webpBuffer[payloadOffset + 8] << 8) | (webpBuffer[payloadOffset + 9] << 16));
+    } else if (fourcc === 'ANIM' || fourcc === 'ANMF') {
+      isAnimated = true;
+    } else if (fourcc === 'VP8 ' && chunkSize >= 10 && width === null) {
+      if (
+        webpBuffer[payloadOffset + 3] === 0x9d &&
+        webpBuffer[payloadOffset + 4] === 0x01 &&
+        webpBuffer[payloadOffset + 5] === 0x2a
+      ) {
+        width = webpBuffer.readUInt16LE(payloadOffset + 6) & 0x3fff;
+        height = webpBuffer.readUInt16LE(payloadOffset + 8) & 0x3fff;
+        if (isAnimated === null) isAnimated = false;
+      }
+    } else if (fourcc === 'VP8L' && chunkSize >= 5 && width === null) {
+      if (webpBuffer[payloadOffset] === 0x2f) {
+        const bits = webpBuffer.readUInt32LE(payloadOffset + 1);
+        width = 1 + (bits & 0x3fff);
+        height = 1 + ((bits >> 14) & 0x3fff);
+        if (isAnimated === null) isAnimated = false;
+      }
+    }
+
+    offset = payloadOffset + chunkSize + (chunkSize % 2);
+  }
+
+  return {
+    width: width && width > 0 ? width : 512,
+    height: height && height > 0 ? height : 512,
+    isAnimated
+  };
+}
+
+/**
  * Faz upload separado do WebP e do OGG/Opus e envia figurinha sonora nativa
- * via fila global do QueueManager com mediatype: 'sticker'.
+ * usando StickerMessage.audioMessage na raiz (compatível com Baileys 6.7.x,
+ * preservando mediatype="sticker" em <enc> e roteando pela fila do QueueManager).
  */
 export async function sendAudioSticker(
   sock,
   jid,
-  { webpBuffer, audioBuffer, durationSeconds, isAnimated = false, emojis, quoted } = {}
+  {
+    webpBuffer,
+    audioBuffer,
+    durationSeconds,
+    isAnimated,
+    emojis,
+    quoted,
+    ephemeralExpiration
+  } = {}
 ) {
   installAudioStickerProto();
 
   const rawSock = sock?._rawSock || sock;
-  if (!rawSock || typeof rawSock.waUploadToServer !== 'function' || typeof rawSock.relayMessage !== 'function') {
-    throw new Error('Socket inválido: waUploadToServer e relayMessage são obrigatórios para sendAudioSticker');
+  if (
+    !rawSock ||
+    typeof rawSock.waUploadToServer !== 'function' ||
+    (typeof rawSock.sendMessage !== 'function' && typeof rawSock.relayMessage !== 'function')
+  ) {
+    throw new Error('Socket inválido: waUploadToServer e sendMessage/relayMessage são obrigatórios para sendAudioSticker');
   }
   if (!jid) {
     throw new Error('JID de destino é obrigatório para sendAudioSticker');
+  }
+  if (!Buffer.isBuffer(webpBuffer) || webpBuffer.length === 0) {
+    throw new Error('Buffer WebP inválido para figurinha com som');
+  }
+  if (!Buffer.isBuffer(audioBuffer) || audioBuffer.length === 0) {
+    throw new Error('Buffer OGG/Opus inválido para figurinha com som');
   }
 
   const stickerPart = await prepareWAMessageMedia(
@@ -344,11 +429,17 @@ export async function sendAudioSticker(
   // O WhatsApp exige AudioMessage embutido sem o campo ptt de nota de voz
   delete audioMessage.ptt;
 
+  const webpMeta = parseWebpMetadata(webpBuffer);
+  const resolvedIsAnimated = isAnimated !== undefined
+    ? Boolean(isAnimated)
+    : Boolean(webpMeta.isAnimated);
+
   const stickerMessage = {
     ...proto.Message.StickerMessage.toObject(stickerPart.stickerMessage),
-    width: 512,
-    height: 512,
-    isAnimated: Boolean(isAnimated),
+    width: webpMeta.width,
+    height: webpMeta.height,
+    isAnimated: resolvedIsAnimated,
+    isLottie: false,
     accessibilityLabel: '',
     audioMessage
   };
@@ -358,37 +449,48 @@ export async function sendAudioSticker(
     stickerMessage.emojis = normalizedEmojis;
   }
 
-  // normalizeMessageContent do Baileys não desembrulha audioStickerMessage; aplicamos quoted
-  // primeiro sobre stickerMessage para que contextInfo seja preservado dentro do wrapper.
-  let finalStickerMessage = stickerMessage;
-  if (quoted?.key && quoted?.message) {
-    const quotedBase = generateWAMessageFromContent(
-      jid,
-      { stickerMessage },
-      { userJid: rawSock.user?.id, quoted }
-    );
-    finalStickerMessage = quotedBase.message.stickerMessage;
+  const hasQuoted = Boolean(quoted?.key && quoted?.message);
+  const resolvedExpiration = Number(ephemeralExpiration) > 0
+    ? Number(ephemeralExpiration)
+    : undefined;
+
+  // Caminho principal: envia via sock.sendMessage({ forward }) com fromMe: true para
+  // limpar flags de encaminhamento e deixar o Baileys gerar <enc mediatype="sticker">,
+  // aplicar quoted/ephemeralExpiration e usar sendWithRetry na fila do QueueManager.
+  if (typeof rawSock.sendMessage === 'function') {
+    const forwardContent = {
+      forward: {
+        key: {
+          remoteJid: jid,
+          fromMe: true
+        },
+        message: proto.Message.fromObject({ stickerMessage })
+      }
+    };
+    const sendOptions = {
+      ...(hasQuoted ? { quoted } : {}),
+      ...(resolvedExpiration ? { ephemeralExpiration: resolvedExpiration } : {})
+    };
+
+    if (sock?._isQueueWrapped && typeof sock.sendMessage === 'function') {
+      return await sock.sendMessage(jid, forwardContent, sendOptions);
+    }
+    return await queueManager.sendMessage(rawSock, jid, forwardContent, sendOptions);
   }
 
-  const msgPayload = {
-    audioStickerMessage: {
-      message: {
-        stickerMessage: finalStickerMessage
-      }
-    }
+  // Fallback para sockets mínimos que expõem apenas relayMessage (ex.: mocks de teste)
+  const genOptions = {
+    userJid: rawSock.user?.id,
+    ...(hasQuoted ? { quoted } : {}),
+    ...(resolvedExpiration ? { ephemeralExpiration: resolvedExpiration } : {})
   };
-
-  const fullMsg = generateWAMessageFromContent(jid, msgPayload, {
-    userJid: rawSock.user?.id
-  });
+  const fullMsg = generateWAMessageFromContent(jid, { stickerMessage }, genOptions);
 
   return new Promise((resolve, reject) => {
     queueManager.enqueueMessage(jid, async () => {
       try {
-        // getMediaType do Baileys retorna undefined para audioStickerMessage; forçamos mediatype: 'sticker'
         await rawSock.relayMessage(jid, fullMsg.message, {
-          messageId: fullMsg.key.id,
-          additionalAttributes: { mediatype: 'sticker' }
+          messageId: fullMsg.key.id
         });
         resolve(fullMsg);
       } catch (err) {

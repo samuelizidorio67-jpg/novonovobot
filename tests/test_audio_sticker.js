@@ -10,6 +10,7 @@ import { queueManager } from '../src/queue/QueueManager.js';
 import {
   installAudioStickerProto,
   unwrapAudioStickerMessage,
+  parseWebpMetadata,
   sendAudioSticker
 } from '../src/utils/audioStickerProto.js';
 import {
@@ -210,6 +211,7 @@ try {
     durationSeconds: 4.4,
     isAnimated: true,
     emojis: '🎵',
+    ephemeralExpiration: 86400,
     quoted: {
       key: { remoteJid: targetJid, id: 'QUOTED_1', fromMe: false },
       message: { conversation: 'manda figurinha' }
@@ -226,22 +228,29 @@ try {
   assert.strictEqual(relayed.length, 1);
   assert.strictEqual(relayed[0].jid, targetJid);
   assert.strictEqual(relayed[0].options.messageId, sentMsg.key.id);
-  assert.deepStrictEqual(relayed[0].options.additionalAttributes, { mediatype: 'sticker' });
+  assert.strictEqual(
+    relayed[0].options.additionalAttributes,
+    undefined,
+    'relayMessage não deve injetar mediatype no <message> externo'
+  );
 
   // Roundtrip wire bytes do payload efetivamente enviado ao relayMessage
   const wireDecoded = proto.Message.decode(proto.Message.encode(relayed[0].message).finish());
-  const sm = wireDecoded.audioStickerMessage?.message?.stickerMessage;
-  assert(sm, 'Payload enviado deve decodificar stickerMessage dentro de audioStickerMessage');
+  const sm = wireDecoded.stickerMessage;
+  assert(sm, 'Payload enviado deve enviar stickerMessage na raiz para o Baileys detectar mediatype="sticker" em <enc>');
+  assert.strictEqual(wireDecoded.audioStickerMessage, null, 'Envio não deve encapsular em audioStickerMessage');
   assert.strictEqual(sm.url, 'https://mmg.whatsapp.net/sticker');
   assert.strictEqual(sm.directPath, '/v/sticker');
   assert.strictEqual(sm.mimetype, 'image/webp');
   assert.strictEqual(sm.width, 512);
   assert.strictEqual(sm.height, 512);
   assert.strictEqual(sm.isAnimated, true);
+  assert.strictEqual(sm.isLottie, false);
   assert.strictEqual(sm.accessibilityLabel, '');
   assert.strictEqual(sm.emojis, '🎵');
   assert.strictEqual(sm.contextInfo?.stanzaId, 'QUOTED_1');
   assert.strictEqual(sm.contextInfo?.quotedMessage?.conversation, 'manda figurinha');
+  assert.strictEqual(sm.contextInfo?.expiration, 86400);
   assert.strictEqual(sm.audioMessage?.url, 'https://mmg.whatsapp.net/audio');
   assert.strictEqual(sm.audioMessage?.directPath, '/v/audio');
   assert.strictEqual(sm.audioMessage?.mimetype, 'audio/ogg; codecs=opus');
@@ -259,10 +268,54 @@ try {
   assert(sentSimple?.key?.id);
   assert.strictEqual(relayed.length, 2);
   const wireSimple = proto.Message.decode(proto.Message.encode(relayed[1].message).finish());
-  const smSimple = wireSimple.audioStickerMessage.message.stickerMessage;
+  const smSimple = wireSimple.stickerMessage;
   assert.strictEqual(smSimple.isAnimated, false);
   assert.strictEqual(smSimple.emojis, null);
   assert.strictEqual(smSimple.audioMessage.seconds, 1);
+
+  // Envio via sock.sendMessage({ forward }) preservando audioMessage, quoted, expiration e sem isForwarded
+  const forwardCalls = [];
+  const { generateWAMessage } = await import('@whiskeysockets/baileys');
+  const sendCapableRawSock = {
+    user: { id: '5511999999999:1@s.whatsapp.net' },
+    waUploadToServer: async (filePath, uploadOpts) => ({
+      mediaUrl: `https://mmg.whatsapp.net/${uploadOpts.mediaType}`,
+      directPath: `/v/${uploadOpts.mediaType}`
+    }),
+    sendMessage: async (jid, content, options) => {
+      forwardCalls.push({ jid, content, options });
+      return generateWAMessage(jid, content, {
+        userJid: '5511999999999:1@s.whatsapp.net',
+        upload: async () => ({ mediaUrl: 'https://mmg.whatsapp.net/unused', directPath: '/unused' }),
+        ...options
+      });
+    },
+    relayMessage: async () => {
+      throw new Error('Não deve chamar relayMessage direto quando sendMessage existir');
+    }
+  };
+  const sendCapableWrapped = queueManager.wrapSocket(sendCapableRawSock);
+  const sentForward = await sendAudioSticker(sendCapableWrapped, targetJid, {
+    webpBuffer: Buffer.from('RIFF\x00\x00\x00\x00WEBP'),
+    audioBuffer: Buffer.from('OggS\x00\x02'),
+    durationSeconds: 3.2,
+    isAnimated: true,
+    ephemeralExpiration: 604800,
+    quoted: {
+      key: { remoteJid: targetJid, id: 'QUOTED_FWD', fromMe: false },
+      message: { conversation: 'faz ai' }
+    }
+  });
+  assert.strictEqual(forwardCalls.length, 1);
+  assert.strictEqual(forwardCalls[0].content.forward?.key?.fromMe, true);
+  assert.strictEqual(forwardCalls[0].options.ephemeralExpiration, 604800);
+  const fwdSm = sentForward.message?.stickerMessage;
+  assert(fwdSm?.audioMessage, 'Baileys generateWAMessage({ forward }) deve preservar stickerMessage.audioMessage');
+  assert.strictEqual(fwdSm.isAnimated, true);
+  assert.strictEqual(fwdSm.audioMessage.seconds, 3);
+  assert.strictEqual(fwdSm.contextInfo?.stanzaId, 'QUOTED_FWD');
+  assert.strictEqual(fwdSm.contextInfo?.expiration, 604800);
+  assert(!fwdSm.contextInfo?.isForwarded, 'forward com fromMe:true não deve marcar isForwarded');
 
   // Propagação de erro do relayMessage
   const failingSock = {
@@ -397,15 +450,24 @@ try {
     (err) => err instanceof Error && err.message.includes('NO_AUDIO_STREAM')
   );
 
-  // 4. convertVideoToSoundStickerWebp: WebP válido <= 490000 bytes
+  // 4. convertVideoToSoundStickerWebp: WebP válido <= 490000 bytes (512x512 animado)
   const animWebp = await convertVideoToSoundStickerWebp(videoWithAudioPath, 5);
   assertIsWebpBuffer(animWebp, 'convertVideoToSoundStickerWebp');
   assert(animWebp.length <= 490000, `WebP animado deve ter <= 490000 bytes (obtido ${animWebp.length})`);
+  assert.deepStrictEqual(
+    parseWebpMetadata(animWebp),
+    { width: 512, height: 512, isAnimated: true },
+    'WebP animado gerado deve informar 512x512 e isAnimated=true'
+  );
 
-  // 5. convertImageToSoundStickerWebp: WebP válido <= 450*1024 bytes
+  // 5. convertImageToSoundStickerWebp: WebP válido <= 450*1024 bytes (512x512 estático)
   const staticWebp = await convertImageToSoundStickerWebp(imagePngPath);
   assertIsWebpBuffer(staticWebp, 'convertImageToSoundStickerWebp');
   assert(staticWebp.length <= 490000, `WebP estático deve ter <= 490000 bytes (obtido ${staticWebp.length})`);
+  const staticMeta = parseWebpMetadata(staticWebp);
+  assert.strictEqual(staticMeta.width, 512, 'WebP estático gerado deve ter largura 512');
+  assert.strictEqual(staticMeta.height, 512, 'WebP estático gerado deve ter altura 512');
+  assert.strictEqual(staticMeta.isAnimated, false, 'WebP estático gerado deve ter isAnimated=false');
 
   // 6. Nenhum temporário vazado pelo processo atual
   const leaked = fs.readdirSync(tmpDir).filter((name) => name.startsWith('stickersom-') && name.includes(`-${process.pid}-`));
@@ -644,12 +706,22 @@ try {
       return { downloader, createdCopies };
     };
 
+    const { generateWAMessage: generateFlowWAMessage } = await import('@whiskeysockets/baileys');
     const flowSent = [];
     const flowRelayed = [];
     const flowRawSock = {
       user: { id: '5511999999999:1@s.whatsapp.net' },
       sendMessage: async (jid, content, options) => {
         flowSent.push({ jid, content, options });
+        if (content?.forward) {
+          const fullMsg = await generateFlowWAMessage(jid, content, {
+            userJid: '5511999999999:1@s.whatsapp.net',
+            upload: flowRawSock.waUploadToServer,
+            ...options
+          });
+          await flowRawSock.relayMessage(jid, fullMsg.message, { messageId: fullMsg.key.id });
+          return fullMsg;
+        }
         return { key: { id: `FLOW_${flowSent.length}` } };
       },
       waUploadToServer: async (filePath, opts) => ({
@@ -663,19 +735,33 @@ try {
     };
     const flowSock = queueManager.wrapSocket(flowRawSock);
 
-    // 4a. Vídeo com áudio (7s -> cortado em 5s, isAnimated: true)
+    // 4a. Vídeo com áudio (7s -> cortado em 5s, isAnimated: true, preservando ephemeralExpiration)
+    const ephemeralVideoMsg = {
+      ...directVideoMsg,
+      message: {
+        videoMessage: {
+          ...directVideoMsg.message.videoMessage,
+          contextInfo: { expiration: 604800 }
+        }
+      }
+    };
     const avDl = createCopyDownloader({ video: videoWithAudioPath });
     await processSoundStickerSources(
       flowSock,
       testChatJid,
-      directVideoMsg,
-      { mode: 'video', videoMsg: directVideoMsg },
+      ephemeralVideoMsg,
+      { mode: 'video', videoMsg: ephemeralVideoMsg.message.videoMessage },
       avDl.downloader
     );
-    assert.strictEqual(flowRelayed.length, 1, 'Vídeo com áudio deve enviar 1 audioStickerMessage');
+    assert.strictEqual(flowRelayed.length, 1, 'Vídeo com áudio deve enviar 1 stickerMessage sonora');
     const avDecoded = proto.Message.decode(proto.Message.encode(flowRelayed[0].message).finish());
-    assert.strictEqual(avDecoded.audioStickerMessage?.message?.stickerMessage?.isAnimated, true);
-    assert.strictEqual(avDecoded.audioStickerMessage?.message?.stickerMessage?.audioMessage?.seconds, 5);
+    assert.strictEqual(avDecoded.audioStickerMessage, null, 'Envio não deve encapsular em audioStickerMessage');
+    assert.strictEqual(avDecoded.stickerMessage?.width, 512);
+    assert.strictEqual(avDecoded.stickerMessage?.height, 512);
+    assert.strictEqual(avDecoded.stickerMessage?.isAnimated, true);
+    assert.strictEqual(avDecoded.stickerMessage?.audioMessage?.seconds, 5);
+    assert.strictEqual(avDecoded.stickerMessage?.contextInfo?.expiration, 604800);
+    assert(!avDecoded.stickerMessage?.contextInfo?.isForwarded, 'Figurinha enviada não deve ter isForwarded=true');
     assert(avDl.createdCopies.every((p) => !fs.existsSync(p)), 'Arquivo temporário de vídeo deve ser removido no finally');
 
     // 4b. Vídeo mudo (NO_AUDIO_STREAM -> aviso orientando usar /sticker)
@@ -689,7 +775,7 @@ try {
       { mode: 'video', videoMsg: directVideoMsg },
       silentDl.downloader
     );
-    assert.strictEqual(flowRelayed.length, 0, 'Vídeo mudo não deve enviar audioStickerMessage');
+    assert.strictEqual(flowRelayed.length, 0, 'Vídeo mudo não deve enviar stickerMessage sonora');
     const lastSilentMsg = flowSent[flowSent.length - 1]?.content?.text || '';
     assert(lastSilentMsg.startsWith('⚠️'), `Vídeo mudo deve responder aviso (⚠️), obtido: ${lastSilentMsg}`);
     assert(lastSilentMsg.includes('/sticker'), `Vídeo mudo deve orientar a usar /sticker, obtido: ${lastSilentMsg}`);
@@ -706,10 +792,13 @@ try {
       imgAudioRes,
       imgAudDl.downloader
     );
-    assert.strictEqual(flowRelayed.length, 1, 'Imagem + áudio deve enviar 1 audioStickerMessage');
+    assert.strictEqual(flowRelayed.length, 1, 'Imagem + áudio deve enviar 1 stickerMessage sonora');
     const imgAudDecoded = proto.Message.decode(proto.Message.encode(flowRelayed[0].message).finish());
-    assert.strictEqual(imgAudDecoded.audioStickerMessage?.message?.stickerMessage?.isAnimated, false);
-    assert.strictEqual(imgAudDecoded.audioStickerMessage?.message?.stickerMessage?.audioMessage?.seconds, 10);
+    assert.strictEqual(imgAudDecoded.audioStickerMessage, null, 'Envio não deve encapsular em audioStickerMessage');
+    assert.strictEqual(imgAudDecoded.stickerMessage?.width, 512);
+    assert.strictEqual(imgAudDecoded.stickerMessage?.height, 512);
+    assert.strictEqual(imgAudDecoded.stickerMessage?.isAnimated, false);
+    assert.strictEqual(imgAudDecoded.stickerMessage?.audioMessage?.seconds, 10);
     assert(imgAudDl.createdCopies.every((p) => !fs.existsSync(p)), 'Arquivos temporários de imagem e áudio devem ser removidos no finally');
 
     // 5. Suporte do /unsticker para audioStickerMessage recebida

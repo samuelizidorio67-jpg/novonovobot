@@ -8,6 +8,7 @@ import ffmpegPath from 'ffmpeg-static';
 const execFileAsync = promisify(execFile);
 
 const MAX_EXEC_BUFFER = 10 * 1024 * 1024;
+const FFMPEG_TIMEOUT_MS = 60000;
 const MAX_ANIMATED_WEBP_BYTES = 490000;
 const MAX_STATIC_WEBP_BYTES = 450 * 1024;
 
@@ -31,7 +32,10 @@ async function safeUnlink(filePath) {
 async function runFfmpegToBuffer(prefix, extension, args) {
   const outputPath = createTempFilePath(prefix, extension);
   try {
-    await execFileAsync(ffmpegPath, [...args, outputPath], { maxBuffer: MAX_EXEC_BUFFER });
+    await execFileAsync(ffmpegPath, [...args, outputPath], {
+      maxBuffer: MAX_EXEC_BUFFER,
+      timeout: FFMPEG_TIMEOUT_MS
+    });
     return await fs.promises.readFile(outputPath);
   } finally {
     await safeUnlink(outputPath);
@@ -58,7 +62,10 @@ export async function probeMediaInfo(inputPath) {
   let probeError = null;
 
   try {
-    const result = await execFileAsync(ffmpegPath, ['-i', inputPath], { maxBuffer: MAX_EXEC_BUFFER });
+    const result = await execFileAsync(ffmpegPath, ['-i', inputPath], {
+      maxBuffer: MAX_EXEC_BUFFER,
+      timeout: FFMPEG_TIMEOUT_MS
+    });
     stderr = result.stderr || '';
   } catch (err) {
     probeError = err;
@@ -99,16 +106,21 @@ export async function extractOggOpusAudio(inputPath, maxSeconds = 10) {
     '-map', '0:a:0',
     '-t', String(maxSeconds),
     '-c:a', 'libopus',
-    '-b:a', '32k',
+    '-b:a', '48k',
+    '-vbr', 'on',
+    '-compression_level', '10',
+    '-frame_duration', '20',
     '-ar', '48000',
     '-ac', '1',
-    '-application', 'voip'
+    '-application', 'voip',
+    '-avoid_negative_ts', 'make_zero',
+    '-map_metadata', '-1'
   ]);
 }
 
 /**
  * Converte vídeo para figurinha WebP animada (512x512, até `maxSeconds`),
- * reduzindo escala/fps/qualidade caso ultrapasse 490000 bytes.
+ * reduzindo fps/qualidade (e escala em último caso) caso ultrapasse 490000 bytes.
  * @param {string} inputPath
  * @param {number} [maxSeconds=5]
  * @returns {Promise<Buffer>}
@@ -116,13 +128,14 @@ export async function extractOggOpusAudio(inputPath, maxSeconds = 10) {
 export async function convertVideoToSoundStickerWebp(inputPath, maxSeconds = 5) {
   const passes = [
     { size: 512, fps: 10, qscale: 45 },
-    { size: 384, fps: 8, qscale: 35 },
-    { size: 256, fps: 6, qscale: 25 }
+    { size: 512, fps: 8, qscale: 30 },
+    { size: 512, fps: 6, qscale: 20 },
+    { size: 384, fps: 6, qscale: 20 }
   ];
 
   let lastBuffer = null;
   for (const pass of passes) {
-    const vf = `[0:v] scale=${pass.size}:${pass.size}:force_original_aspect_ratio=decrease,fps=${pass.fps},pad=${pass.size}:${pass.size}:(ow-iw)/2:(oh-ih)/2:color=0x00000000`;
+    const vf = `[0:v] format=rgba,scale=${pass.size}:${pass.size}:force_original_aspect_ratio=decrease,fps=${pass.fps},pad=${pass.size}:${pass.size}:(ow-iw)/2:(oh-ih)/2:color=0x00000000`;
     const buffer = await runFfmpegToBuffer('stickersom-anim', 'webp', [
       '-y',
       '-i', inputPath,
@@ -154,7 +167,7 @@ export async function convertVideoToSoundStickerWebp(inputPath, maxSeconds = 5) 
  */
 export async function convertImageToSoundStickerWebp(inputPath) {
   const qualities = [85, 60, 35];
-  const vf = 'scale=512:512:force_original_aspect_ratio=decrease,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=0x00000000';
+  const vf = 'format=rgba,scale=512:512:force_original_aspect_ratio=decrease,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=0x00000000';
 
   let lastBuffer = null;
   for (const quality of qualities) {

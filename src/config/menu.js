@@ -23,6 +23,7 @@ export const CATEGORIAS = [
       ['sticker', 'Criar figurinha de imagem ou vídeo'],
       ['sticker2', 'Figurinha com a proporção original, sem distorcer'],
       ['sticker3', 'Figurinha maior, preenchendo o quadrado'],
+      ['stickersom', 'Criar figurinha com áudio (vídeo ou imagem + áudio)'],
       ['unsticker', 'Transformar figurinha em imagem'],
       ['ver', 'Revelar mídia de visualização única (restrito)'],
     ],

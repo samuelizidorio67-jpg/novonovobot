@@ -33,7 +33,8 @@ const WRAPPER_KEYS = [
   'groupStatusMessage',
   'limitSharingMessage',
   'botTaskMessage',
-  'questionMessage'
+  'questionMessage',
+  'audioStickerMessage'
 ];
 
 const VIEW_ONCE_WRAPPER_KEYS = [

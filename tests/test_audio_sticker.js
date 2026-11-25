@@ -18,6 +18,16 @@ import {
   convertVideoToSoundStickerWebp,
   convertImageToSoundStickerWebp
 } from '../src/utils/audioStickerMedia.js';
+import { unwrapMessageContent } from '../src/utils/viewOnceManager.js';
+import {
+  extractSoundStickerSources,
+  extractUnstickerSource,
+  processSoundStickerSources,
+  processUnsticker,
+  handleMediaCommands
+} from '../src/commands/media.js';
+import { handleMessages } from '../src/messageHandler.js';
+import { CATEGORIAS, comandosDoMenu, buildMenu, buildLegendaMenu } from '../src/config/menu.js';
 
 console.log('🧪 Iniciando testes do módulo audioStickerProto...');
 
@@ -402,6 +412,424 @@ try {
   assert.deepStrictEqual(leaked, [], `Arquivos temporários vazados em os.tmpdir(): ${leaked.join(', ')}`);
 
   console.log('✅ Todos os testes de audioStickerMedia passaram com sucesso!');
+
+  console.log('🧪 Iniciando testes da Task 3 (/stickersom, /unsticker, unwrapMessageContent, menu e dispatcher)...');
+
+  // 1. unwrapMessageContent com audioStickerMessage expõe stickerMessage
+  const unwrappedMsgContent = unwrapMessageContent({
+    audioStickerMessage: {
+      message: {
+        stickerMessage: { isAnimated: true }
+      }
+    }
+  });
+  assert.strictEqual(unwrappedMsgContent.isViewOnce, false);
+  assert.strictEqual(unwrappedMsgContent.content?.stickerMessage?.isAnimated, true);
+
+  const testChatJid = '120363040000000777@g.us';
+  const testSenderJid = '5571999999888@s.whatsapp.net';
+
+  // 2. extractSoundStickerSources: todas as validações e modos
+  const voDirectRes = extractSoundStickerSources({
+    key: { remoteJid: testChatJid, id: 'VO_DIRECT' },
+    message: {
+      viewOnceMessageV2: {
+        message: {
+          videoMessage: { caption: '/stickersom', seconds: 4 }
+        }
+      }
+    }
+  });
+  assert.deepStrictEqual(voDirectRes, { error: 'VIEWONCE' });
+
+  const voQuotedRes = extractSoundStickerSources({
+    key: { remoteJid: testChatJid, id: 'VO_QUOTED' },
+    message: {
+      imageMessage: {
+        caption: '/stickersom',
+        contextInfo: {
+          stanzaId: 'VO_AUDIO_1',
+          quotedMessage: {
+            viewOnceMessageV2: {
+              message: { audioMessage: { seconds: 3 } }
+            }
+          }
+        }
+      }
+    }
+  });
+  assert.deepStrictEqual(voQuotedRes, { error: 'VIEWONCE' });
+
+  const noneRes = extractSoundStickerSources({
+    key: { remoteJid: testChatJid, id: 'NO_MEDIA' },
+    message: { conversation: '/stickersom' }
+  });
+  assert.deepStrictEqual(noneRes, { error: 'NONE' });
+
+  const textQuotingAudioRes = extractSoundStickerSources({
+    key: { remoteJid: testChatJid, id: 'TEXT_AUDIO' },
+    message: {
+      extendedTextMessage: {
+        text: '/stickersom',
+        contextInfo: {
+          stanzaId: 'AUD_ONLY_1',
+          quotedMessage: { audioMessage: { seconds: 3 } }
+        }
+      }
+    }
+  });
+  assert.deepStrictEqual(textQuotingAudioRes, { error: 'NONE' });
+
+  const tooLongDirectRes = extractSoundStickerSources({
+    key: { remoteJid: testChatJid, id: 'LONG_DIRECT' },
+    message: {
+      videoMessage: { caption: '/stickersom', seconds: 20 }
+    }
+  });
+  assert.deepStrictEqual(tooLongDirectRes, { error: 'VIDEO_TOO_LONG' });
+
+  const tooLongQuotedRes = extractSoundStickerSources({
+    key: { remoteJid: testChatJid, id: 'LONG_QUOTED' },
+    message: {
+      extendedTextMessage: {
+        text: '/stickersom',
+        contextInfo: {
+          stanzaId: 'LONG_VID_1',
+          quotedMessage: { videoMessage: { seconds: 20 } }
+        }
+      }
+    }
+  });
+  assert.deepStrictEqual(tooLongQuotedRes, { error: 'VIDEO_TOO_LONG' });
+
+  const needAudioNonAudioRes = extractSoundStickerSources({
+    key: { remoteJid: testChatJid, id: 'IMG_TEXT' },
+    message: {
+      imageMessage: {
+        caption: '/stickersom',
+        contextInfo: {
+          stanzaId: 'TXT_1',
+          quotedMessage: { conversation: 'isso não é áudio' }
+        }
+      }
+    }
+  });
+  assert.deepStrictEqual(needAudioNonAudioRes, { error: 'NEED_AUDIO' });
+
+  const needAudioNoQuoteRes = extractSoundStickerSources({
+    key: { remoteJid: testChatJid, id: 'IMG_NO_QUOTE' },
+    message: {
+      imageMessage: { caption: '/stickersom' }
+    }
+  });
+  assert.deepStrictEqual(needAudioNoQuoteRes, { error: 'NEED_AUDIO' });
+
+  const imgAudioMsg = {
+    key: { remoteJid: testChatJid, id: 'IMG_AUD_1' },
+    message: {
+      ephemeralMessage: {
+        message: {
+          imageMessage: {
+            caption: '/stickersom',
+            url: 'https://mmg.whatsapp.net/img',
+            contextInfo: {
+              stanzaId: 'QUOTED_AUD_1',
+              participant: testSenderJid,
+              quotedMessage: {
+                audioMessage: {
+                  url: 'https://mmg.whatsapp.net/aud',
+                  seconds: 6
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  };
+  const imgAudioRes = extractSoundStickerSources(imgAudioMsg);
+  assert.strictEqual(imgAudioRes.mode, 'image_audio');
+  assert.strictEqual(imgAudioRes.imageMsg.message.imageMessage.url, 'https://mmg.whatsapp.net/img');
+  assert.strictEqual(imgAudioRes.audioMsg.key.id, 'QUOTED_AUD_1');
+  assert.strictEqual(imgAudioRes.audioMsg.key.participant, testSenderJid);
+  assert.strictEqual(imgAudioRes.audioMsg.message.audioMessage.url, 'https://mmg.whatsapp.net/aud');
+
+  const directVideoMsg = {
+    key: { remoteJid: testChatJid, id: 'VID_DIRECT' },
+    message: {
+      videoMessage: { caption: '/stickersom', seconds: 8, url: 'https://mmg.whatsapp.net/v1' }
+    }
+  };
+  const directVideoRes = extractSoundStickerSources(directVideoMsg);
+  assert.strictEqual(directVideoRes.mode, 'video');
+  assert.strictEqual(directVideoRes.videoMsg.message.videoMessage.url, 'https://mmg.whatsapp.net/v1');
+
+  const quotedVideoMsg = {
+    key: { remoteJid: testChatJid, id: 'VID_QUOTED_CMD' },
+    message: {
+      extendedTextMessage: {
+        text: '/stickersom',
+        contextInfo: {
+          stanzaId: 'VID_QUOTED_1',
+          participant: testSenderJid,
+          quotedMessage: {
+            videoMessage: { seconds: 5, url: 'https://mmg.whatsapp.net/v2' }
+          }
+        }
+      }
+    }
+  };
+  const quotedVideoRes = extractSoundStickerSources(quotedVideoMsg);
+  assert.strictEqual(quotedVideoRes.mode, 'video');
+  assert.strictEqual(quotedVideoRes.videoMsg.key.id, 'VID_QUOTED_1');
+  assert.strictEqual(quotedVideoRes.videoMsg.message.videoMessage.url, 'https://mmg.whatsapp.net/v2');
+
+  // 3. handleMediaCommands(..., 'stickersom', ...) respostas aviso nas validações
+  const cmdSent = [];
+  const cmdSock = {
+    sendMessage: async (jid, content, options) => {
+      cmdSent.push({ jid, content, options });
+      return { key: { id: `CMD_SENT_${cmdSent.length}` } };
+    }
+  };
+
+  for (const [label, msgCase, expectedPattern] of [
+    ['sem mídia', { key: { remoteJid: testChatJid, id: 'C_NONE' }, message: { conversation: '/stickersom' } }, /^⚠️/],
+    ['viewOnce', {
+      key: { remoteJid: testChatJid, id: 'C_VO' },
+      message: { viewOnceMessageV2: { message: { videoMessage: { caption: '/stickersom', seconds: 4 } } } }
+    }, /\/ver/],
+    ['vídeo > 15s', {
+      key: { remoteJid: testChatJid, id: 'C_LONG' },
+      message: { videoMessage: { caption: '/stickersom', seconds: 20 } }
+    }, /15/],
+    ['imagem sem áudio', {
+      key: { remoteJid: testChatJid, id: 'C_NEED_AUD' },
+      message: {
+        imageMessage: {
+          caption: '/stickersom',
+          contextInfo: { stanzaId: 'T_1', quotedMessage: { conversation: 'texto' } }
+        }
+      }
+    }, /áudio/i]
+  ]) {
+    cmdSent.length = 0;
+    await handleMediaCommands(cmdSock, msgCase, 'stickersom', [], testSenderJid);
+    assert.strictEqual(cmdSent.length, 1, `${label}: deve enviar exatamente 1 resposta`);
+    assert(cmdSent[0].content.text.startsWith('⚠️'), `${label}: resposta deve ser aviso (⚠️), recebido: ${cmdSent[0].content.text}`);
+    assert(expectedPattern.test(cmdSent[0].content.text), `${label}: texto inesperado: ${cmdSent[0].content.text}`);
+  }
+
+  // 4. Fluxo completo processSoundStickerSources (vídeo c/ áudio, vídeo mudo NO_AUDIO_STREAM, imagem+áudio e limpeza em finally)
+  const animWebpFixturePath = path.join(tmpDir, `test-stickersom-anim-fix-${testSuffix}.webp`);
+  const staticWebpFixturePath = path.join(tmpDir, `test-stickersom-static-fix-${testSuffix}.webp`);
+  fs.writeFileSync(animWebpFixturePath, animWebp);
+  fs.writeFileSync(staticWebpFixturePath, staticWebp);
+
+  const origDelayMin = queueManager.minDelay;
+  const origDelayMax = queueManager.maxDelay;
+  try {
+    queueManager.minDelay = 0;
+    queueManager.maxDelay = 0;
+
+    const createCopyDownloader = (fixtureMap) => {
+      const createdCopies = [];
+      const downloader = async (mediaMsg, mediaType) => {
+        const srcPath = fixtureMap[mediaType];
+        const copyPath = path.join(tmpDir, `test-dl-${mediaType}-${Date.now()}-${Math.floor(Math.random() * 1e6)}${path.extname(srcPath)}`);
+        fs.copyFileSync(srcPath, copyPath);
+        createdCopies.push(copyPath);
+        return copyPath;
+      };
+      return { downloader, createdCopies };
+    };
+
+    const flowSent = [];
+    const flowRelayed = [];
+    const flowRawSock = {
+      user: { id: '5511999999999:1@s.whatsapp.net' },
+      sendMessage: async (jid, content, options) => {
+        flowSent.push({ jid, content, options });
+        return { key: { id: `FLOW_${flowSent.length}` } };
+      },
+      waUploadToServer: async (filePath, opts) => ({
+        mediaUrl: `https://mmg.whatsapp.net/${opts.mediaType}`,
+        directPath: `/v/${opts.mediaType}`
+      }),
+      relayMessage: async (jid, message, options) => {
+        flowRelayed.push({ jid, message, options });
+        return options.messageId;
+      }
+    };
+    const flowSock = queueManager.wrapSocket(flowRawSock);
+
+    // 4a. Vídeo com áudio (7s -> cortado em 5s, isAnimated: true)
+    const avDl = createCopyDownloader({ video: videoWithAudioPath });
+    await processSoundStickerSources(
+      flowSock,
+      testChatJid,
+      directVideoMsg,
+      { mode: 'video', videoMsg: directVideoMsg },
+      avDl.downloader
+    );
+    assert.strictEqual(flowRelayed.length, 1, 'Vídeo com áudio deve enviar 1 audioStickerMessage');
+    const avDecoded = proto.Message.decode(proto.Message.encode(flowRelayed[0].message).finish());
+    assert.strictEqual(avDecoded.audioStickerMessage?.message?.stickerMessage?.isAnimated, true);
+    assert.strictEqual(avDecoded.audioStickerMessage?.message?.stickerMessage?.audioMessage?.seconds, 5);
+    assert(avDl.createdCopies.every((p) => !fs.existsSync(p)), 'Arquivo temporário de vídeo deve ser removido no finally');
+
+    // 4b. Vídeo mudo (NO_AUDIO_STREAM -> aviso orientando usar /sticker)
+    flowSent.length = 0;
+    flowRelayed.length = 0;
+    const silentDl = createCopyDownloader({ video: silentVideoPath });
+    await processSoundStickerSources(
+      flowSock,
+      testChatJid,
+      directVideoMsg,
+      { mode: 'video', videoMsg: directVideoMsg },
+      silentDl.downloader
+    );
+    assert.strictEqual(flowRelayed.length, 0, 'Vídeo mudo não deve enviar audioStickerMessage');
+    const lastSilentMsg = flowSent[flowSent.length - 1]?.content?.text || '';
+    assert(lastSilentMsg.startsWith('⚠️'), `Vídeo mudo deve responder aviso (⚠️), obtido: ${lastSilentMsg}`);
+    assert(lastSilentMsg.includes('/sticker'), `Vídeo mudo deve orientar a usar /sticker, obtido: ${lastSilentMsg}`);
+    assert(silentDl.createdCopies.every((p) => !fs.existsSync(p)), 'Arquivo temporário de vídeo mudo deve ser removido no finally');
+
+    // 4c. Imagem + áudio citado (12s -> cortado em 10s, isAnimated: false)
+    flowSent.length = 0;
+    flowRelayed.length = 0;
+    const imgAudDl = createCopyDownloader({ image: imagePngPath, audio: audio12sPath });
+    await processSoundStickerSources(
+      flowSock,
+      testChatJid,
+      imgAudioMsg,
+      imgAudioRes,
+      imgAudDl.downloader
+    );
+    assert.strictEqual(flowRelayed.length, 1, 'Imagem + áudio deve enviar 1 audioStickerMessage');
+    const imgAudDecoded = proto.Message.decode(proto.Message.encode(flowRelayed[0].message).finish());
+    assert.strictEqual(imgAudDecoded.audioStickerMessage?.message?.stickerMessage?.isAnimated, false);
+    assert.strictEqual(imgAudDecoded.audioStickerMessage?.message?.stickerMessage?.audioMessage?.seconds, 10);
+    assert(imgAudDl.createdCopies.every((p) => !fs.existsSync(p)), 'Arquivos temporários de imagem e áudio devem ser removidos no finally');
+
+    // 5. Suporte do /unsticker para audioStickerMessage recebida
+    const quotedAudioStickerMsg = {
+      key: { remoteJid: testChatJid, id: 'UNSTICKER_CMD_1' },
+      message: {
+        ephemeralMessage: {
+          message: {
+            extendedTextMessage: {
+              text: '/unsticker',
+              contextInfo: {
+                stanzaId: 'AS_QUOTED_1',
+                participant: testSenderJid,
+                quotedMessage: {
+                  audioStickerMessage: {
+                    message: {
+                      stickerMessage: {
+                        url: 'https://mmg.whatsapp.net/as-anim',
+                        isAnimated: true,
+                        audioMessage: { url: 'https://mmg.whatsapp.net/as-aud', seconds: 4 }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    };
+    const unstickerSource = extractUnstickerSource(quotedAudioStickerMsg);
+    assert(unstickerSource !== null, 'extractUnstickerSource deve aceitar audioStickerMessage recebida');
+    assert.strictEqual(unstickerSource.isAnimated, true);
+    assert.strictEqual(unstickerSource.stickerMessage.message.stickerMessage.url, 'https://mmg.whatsapp.net/as-anim');
+
+    // /unsticker sem figurinha via handleMediaCommands
+    cmdSent.length = 0;
+    await handleMediaCommands(cmdSock, { key: { remoteJid: testChatJid, id: 'U_NONE' }, message: { conversation: '/unsticker' } }, 'unsticker', [], testSenderJid);
+    assert.strictEqual(cmdSent.length, 1);
+    assert(cmdSent[0].content.text.startsWith('⚠️'));
+
+    // Conversão real de audioStickerMessage animada via processUnsticker
+    const unstickerSent = [];
+    const unstickerSock = {
+      sendMessage: async (jid, content, options) => {
+        unstickerSent.push({ jid, content, options });
+        if (content.video?.url) {
+          assert(fs.existsSync(content.video.url), 'Arquivo MP4 convertido deve existir durante envio');
+          assert(fs.statSync(content.video.url).size > 0, 'Arquivo MP4 convertido deve ser não vazio');
+        }
+        if (content.image?.url) {
+          assert(fs.existsSync(content.image.url), 'Arquivo PNG convertido deve existir durante envio');
+          assert(fs.statSync(content.image.url).size > 0, 'Arquivo PNG convertido deve ser não vazio');
+        }
+        return { key: { id: `UNS_${unstickerSent.length}` } };
+      }
+    };
+
+    const animUnstickerDl = createCopyDownloader({ sticker: animWebpFixturePath });
+    await processUnsticker(unstickerSock, testChatJid, quotedAudioStickerMsg, unstickerSource, animUnstickerDl.downloader);
+    assert(unstickerSent.some((m) => m.content.video && m.content.gifPlayback === true), '/unsticker em audioStickerMessage animada deve enviar GIF/vídeo');
+    assert(animUnstickerDl.createdCopies.every((p) => !fs.existsSync(p)), 'WebP baixado no /unsticker animado deve ser limpo no finally');
+
+    const staticAudioStickerSource = extractUnstickerSource({
+      key: { remoteJid: testChatJid, id: 'UNSTICKER_CMD_2' },
+      message: {
+        extendedTextMessage: {
+          text: '/unsticker',
+          contextInfo: {
+            stanzaId: 'AS_QUOTED_2',
+            quotedMessage: {
+              audioStickerMessage: {
+                message: {
+                  stickerMessage: {
+                    url: 'https://mmg.whatsapp.net/as-static',
+                    isAnimated: false,
+                    audioMessage: { url: 'https://mmg.whatsapp.net/as-aud2', seconds: 3 }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    });
+    assert.strictEqual(staticAudioStickerSource.isAnimated, false);
+    unstickerSent.length = 0;
+    const staticUnstickerDl = createCopyDownloader({ sticker: staticWebpFixturePath });
+    await processUnsticker(unstickerSock, testChatJid, quotedAudioStickerMsg, staticAudioStickerSource, staticUnstickerDl.downloader);
+    assert(unstickerSent.some((m) => m.content.image), '/unsticker em audioStickerMessage estática deve enviar imagem PNG');
+    assert(staticUnstickerDl.createdCopies.every((p) => !fs.existsSync(p)), 'WebP baixado no /unsticker estático deve ser limpo no finally');
+
+    // 6. Menu e Dispatcher (messageHandler.js)
+    const mediaCat = CATEGORIAS.find((c) => c.titulo === 'MÍDIA & DOWNLOADS');
+    assert(mediaCat, 'Categoria MÍDIA & DOWNLOADS deve existir no menu');
+    assert(mediaCat.comandos.some(([cmdName]) => cmdName === 'stickersom'), 'Menu deve listar stickersom em MÍDIA & DOWNLOADS');
+    assert(comandosDoMenu().includes('stickersom'), 'comandosDoMenu() deve conter stickersom');
+    assert(buildMenu({ prefixo: '/', usuario: 'Tester' }).includes('/stickersom'), 'buildMenu deve incluir /stickersom');
+    assert(buildLegendaMenu({ prefixo: '/', usuario: '5571999999999', saudacao: '🌅 Bom dia' }).length <= 1000, 'Legenda compacta do menu não deve estourar 1000 caracteres');
+
+    flowSent.length = 0;
+    await handleMessages(flowRawSock, {
+      key: { remoteJid: testChatJid, participant: testSenderJid, id: 'DISPATCH_1' },
+      pushName: 'Tester',
+      messageTimestamp: Math.floor(Date.now() / 1000),
+      message: { conversation: '/stickersom' }
+    });
+    assert.strictEqual(flowSent.length, 1, 'Dispatcher deve rotear /stickersom para handleMediaCommands');
+    assert(flowSent[0].content.text.startsWith('⚠️'), 'Dispatcher de /stickersom sem mídia deve devolver aviso');
+  } finally {
+    queueManager.minDelay = origDelayMin;
+    queueManager.maxDelay = origDelayMax;
+    for (const extraFixture of [animWebpFixturePath, staticWebpFixturePath]) {
+      try {
+        if (fs.existsSync(extraFixture)) fs.unlinkSync(extraFixture);
+      } catch (_) {}
+    }
+  }
+
+  console.log('✅ Todos os testes da Task 3 passaram com sucesso!');
 } finally {
   for (const filePath of [
     videoWithAudioPath,

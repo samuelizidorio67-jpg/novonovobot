@@ -484,7 +484,7 @@ export async function handleMessages(rawSock, msg) {
       await handleMediaCommands(sock, msg, command, args, sender, from);
     }
     // Comandos de Mídia (Downloads/Stickers)
-    else if (['sticker', 'sticker2', 'sticker3', 'unsticker', 'play', 'video', 'tiktok', 'ttvideo', 'tiktokaudio', 'ttplay', 'ig', 'insta', 'igvideo', 'igaudio', 'instavideo', 'instaaudio', 'igplay'].includes(command)) {
+    else if (['sticker', 'sticker2', 'sticker3', 'stickersom', 'unsticker', 'play', 'video', 'tiktok', 'ttvideo', 'tiktokaudio', 'ttplay', 'ig', 'insta', 'igvideo', 'igaudio', 'instavideo', 'instaaudio', 'igplay'].includes(command)) {
       await queueManager.enqueueHeavyCommand(from, command, () => handleMediaCommands(sock, msg, command, args, sender, from));
     }
     // 👥 Administração Adicional

@@ -2,7 +2,9 @@ import { Sticker, StickerTypes } from 'wa-sticker-formatter';
 import { getDatabase } from '../database.js';
 import { downloadWhatsAppMedia, downloadYoutubeAudio, downloadYoutubeVideo, downloadTiktokVideo, downloadTiktokAudio, downloadInstagramVideo, downloadInstagramAudio } from '../utils/helpers.js';
 import { checkIfOwner, isAuthorizedForVer, isPhoneJid, resolveSenderCandidates } from './admin.js';
-import { findViewOnce, downloadViewOnceFile, extractContextInfo, extractViewOnce } from '../utils/viewOnceManager.js';
+import { findViewOnce, downloadViewOnceFile, extractContextInfo, extractViewOnce, unwrapMessageContent } from '../utils/viewOnceManager.js';
+import { installAudioStickerProto, sendAudioSticker, unwrapAudioStickerMessage } from '../utils/audioStickerProto.js';
+import { probeMediaInfo, extractOggOpusAudio, convertVideoToSoundStickerWebp, convertImageToSoundStickerWebp } from '../utils/audioStickerMedia.js';
 import { aviso, erro, uso } from '../config/messages.js';
 import ffmpeg from 'fluent-ffmpeg';
 import ffmpegPath from 'ffmpeg-static';
@@ -12,19 +14,34 @@ import os from 'os';
 
 import { execFile } from 'child_process';
 
-// Configura o caminho do ffmpeg
+// Configura o caminho do ffmpeg e instala extensão WAProto para audioStickerMessage
 ffmpeg.setFfmpegPath(ffmpegPath);
+installAudioStickerProto();
 
-// Função para converter WebP estático para PNG usando FFMPEG
-function convertWebpToPng(inputPath) {
-  const outputPath = path.join(os.tmpdir(), `unsticker-${Date.now()}.png`);
-  return new Promise((resolve, reject) => {
-    ffmpeg(inputPath)
-      .output(outputPath)
-      .on('end', () => resolve(outputPath))
-      .on('error', (err) => reject(err))
-      .run();
-  });
+// Função para converter WebP para PNG (com fallback via sharp para WebP animado)
+async function convertWebpToPng(inputPath) {
+  const outputPath = path.join(os.tmpdir(), `unsticker-${Date.now()}-${Math.floor(Math.random() * 1e6)}.png`);
+  try {
+    await new Promise((resolve, reject) => {
+      ffmpeg(inputPath)
+        .output(outputPath)
+        .on('end', () => resolve())
+        .on('error', (err) => reject(err))
+        .run();
+    });
+    return outputPath;
+  } catch (ffmpegErr) {
+    try {
+      const { default: sharp } = await import('sharp');
+      await sharp(inputPath, { page: 0 }).png().toFile(outputPath);
+      return outputPath;
+    } catch (_) {
+      if (fs.existsSync(outputPath)) {
+        try { fs.unlinkSync(outputPath); } catch (__) {}
+      }
+      throw ffmpegErr;
+    }
+  }
 }
 
 // Função para converter Vídeo em Figurinha Animada WebP (Otimizado para WhatsApp Celular)
@@ -90,9 +107,7 @@ function convertVideoToAnimatedSticker(inputPath) {
   });
 }
 
-// Função para converter Figurinha Animada (WebP) em MP4/GIF
-function convertWebpToMp4(inputPath) {
-  const outputPath = path.join(os.tmpdir(), `unsticker-anim-${Date.now()}.mp4`);
+function transcodeToMp4(inputPath, outputPath) {
   return new Promise((resolve, reject) => {
     const args = [
       '-y',
@@ -108,6 +123,31 @@ function convertWebpToMp4(inputPath) {
       resolve(outputPath);
     });
   });
+}
+
+// Função para converter Figurinha Animada (WebP) em MP4/GIF
+// FFmpeg 6.x não decodifica chunks ANIM/ANMF de WebP animado; nesses casos rasterizamos via sharp -> GIF -> MP4.
+async function convertWebpToMp4(inputPath) {
+  const outputPath = path.join(os.tmpdir(), `unsticker-anim-${Date.now()}-${Math.floor(Math.random() * 1e6)}.mp4`);
+  try {
+    return await transcodeToMp4(inputPath, outputPath);
+  } catch (ffmpegErr) {
+    const tempGifPath = path.join(os.tmpdir(), `unsticker-anim-${Date.now()}-${Math.floor(Math.random() * 1e6)}.gif`);
+    try {
+      const { default: sharp } = await import('sharp');
+      await sharp(inputPath, { animated: true }).gif().toFile(tempGifPath);
+      return await transcodeToMp4(tempGifPath, outputPath);
+    } catch (_) {
+      if (fs.existsSync(outputPath)) {
+        try { fs.unlinkSync(outputPath); } catch (__) {}
+      }
+      throw ffmpegErr;
+    } finally {
+      if (fs.existsSync(tempGifPath)) {
+        try { fs.unlinkSync(tempGifPath); } catch (_) {}
+      }
+    }
+  }
 }
 
 // Detecta se a mensagem citada é de visualização única (qualquer wrapper)
@@ -248,6 +288,261 @@ export async function sendAudioCompat(sock, from, filePath, title, quotedMsg) {
   }
 }
 
+function buildQuotedMessage(from, contextInfo, message) {
+  return {
+    key: {
+      remoteJid: from,
+      id: contextInfo.stanzaId,
+      participant: contextInfo.participant
+    },
+    message
+  };
+}
+
+/**
+ * Extrai as fontes de mídia compatíveis para /stickersom:
+ * 1. Bloqueia qualquer mídia de visualização única (direta ou citada)
+ * 2. Vídeo direto ou citado (<= 15 s) -> { mode: 'video', videoMsg }
+ * 3. Imagem direta citando áudio -> { mode: 'image_audio', imageMsg, audioMsg }
+ */
+export function extractSoundStickerSources(msg) {
+  if (!msg?.message || typeof msg.message !== 'object') {
+    return { error: 'NONE' };
+  }
+
+  const from = msg.key?.remoteJid;
+  const contextInfo = extractContextInfo(msg);
+  const quotedRaw = contextInfo?.quotedMessage;
+
+  if (extractViewOnce(msg.message) || (quotedRaw && extractViewOnce(quotedRaw))) {
+    return { error: 'VIEWONCE' };
+  }
+
+  const { content: directContent } = unwrapMessageContent(msg.message);
+  const { content: quotedContent } = unwrapMessageContent(quotedRaw);
+
+  if (directContent?.videoMessage) {
+    if (Number(directContent.videoMessage.seconds || 0) > 15) {
+      return { error: 'VIDEO_TOO_LONG' };
+    }
+    const videoMsg = directContent === msg.message ? msg : { ...msg, message: directContent };
+    return { mode: 'video', videoMsg };
+  }
+
+  if (directContent?.imageMessage) {
+    if (quotedContent?.audioMessage) {
+      const imageMsg = directContent === msg.message ? msg : { ...msg, message: directContent };
+      return {
+        mode: 'image_audio',
+        imageMsg,
+        audioMsg: buildQuotedMessage(from, contextInfo, quotedContent)
+      };
+    }
+    return { error: 'NEED_AUDIO' };
+  }
+
+  if (quotedContent?.videoMessage) {
+    if (Number(quotedContent.videoMessage.seconds || 0) > 15) {
+      return { error: 'VIDEO_TOO_LONG' };
+    }
+    return {
+      mode: 'video',
+      videoMsg: buildQuotedMessage(from, contextInfo, quotedContent)
+    };
+  }
+
+  return { error: 'NONE' };
+}
+
+/**
+ * Baixa mídias, converte áudio/WebP respeitando limites (5s vídeo, 10s imagem+áudio)
+ * e envia figurinha sonora nativa garantindo remoção de temporários em finally.
+ */
+export async function processSoundStickerSources(
+  sock,
+  from,
+  msg,
+  sources,
+  downloadFn = downloadWhatsAppMedia
+) {
+  const reply = async (text) => {
+    await sock.sendMessage(from, { text }, { quoted: msg });
+  };
+
+  if (!sources || sources.error === 'VIEWONCE') {
+    return reply(aviso('Mídia de visualização única não pode virar figurinha. Ela só pode ser revelada com o comando */ver*, que é restrito.'));
+  }
+  if (sources.error === 'VIDEO_TOO_LONG') {
+    return reply(aviso('O vídeo deve ter no máximo *15 segundos* para virar figurinha com som.'));
+  }
+  if (sources.error === 'NEED_AUDIO') {
+    return reply(aviso('Para criar figurinha com som usando uma imagem, responda a um áudio enviando a imagem com */stickersom* na legenda.'));
+  }
+  if (sources.error || !sources.mode) {
+    return reply(aviso('Envie ou responda a um vídeo curto com */stickersom*, ou responda a um áudio enviando uma imagem com */stickersom* na legenda.'));
+  }
+
+  await reply('⏳ Criando sua figurinha com som, aguarde...');
+
+  const tempFiles = [];
+  try {
+    if (sources.mode === 'video') {
+      const videoPath = await downloadFn(sources.videoMsg, 'video');
+      tempFiles.push(videoPath);
+
+      const mediaInfo = await probeMediaInfo(videoPath);
+      if (mediaInfo.durationSeconds > 15) {
+        return reply(aviso('O vídeo deve ter no máximo *15 segundos* para virar figurinha com som.'));
+      }
+      if (!mediaInfo.hasAudio) {
+        throw new Error('NO_AUDIO_STREAM');
+      }
+
+      const audioBuffer = await extractOggOpusAudio(videoPath, 5);
+      const webpBuffer = await convertVideoToSoundStickerWebp(videoPath, 5);
+      const durationSeconds = mediaInfo.durationSeconds > 0
+        ? Math.min(mediaInfo.durationSeconds, 5)
+        : 5;
+
+      await sendAudioSticker(sock, from, {
+        webpBuffer,
+        audioBuffer,
+        durationSeconds,
+        isAnimated: true,
+        quoted: msg
+      });
+      return;
+    }
+
+    if (sources.mode === 'image_audio') {
+      const imagePath = await downloadFn(sources.imageMsg, 'image');
+      tempFiles.push(imagePath);
+
+      const audioPath = await downloadFn(sources.audioMsg, 'audio');
+      tempFiles.push(audioPath);
+
+      const audioInfo = await probeMediaInfo(audioPath);
+      if (!audioInfo.hasAudio) {
+        throw new Error('NO_AUDIO_STREAM');
+      }
+
+      const audioBuffer = await extractOggOpusAudio(audioPath, 10);
+      const webpBuffer = await convertImageToSoundStickerWebp(imagePath);
+      const durationSeconds = audioInfo.durationSeconds > 0
+        ? Math.min(audioInfo.durationSeconds, 10)
+        : 10;
+
+      await sendAudioSticker(sock, from, {
+        webpBuffer,
+        audioBuffer,
+        durationSeconds,
+        isAnimated: false,
+        quoted: msg
+      });
+    }
+  } catch (error) {
+    if (error?.message === 'NO_AUDIO_STREAM' || error?.message?.includes('NO_AUDIO_STREAM')) {
+      if (sources.mode === 'video') {
+        return reply(aviso('Esse vídeo não possui faixa de áudio. Use */sticker* para criar uma figurinha animada sem som.'));
+      }
+      return reply(aviso('O áudio citado não possui uma faixa de áudio válida.'));
+    }
+    console.error('Erro ao criar figurinha com som:', error);
+    return reply(erro('Não consegui criar a figurinha com som. Verifique se a mídia é válida e tente novamente.'));
+  } finally {
+    for (const filePath of tempFiles) {
+      if (filePath && fs.existsSync(filePath)) {
+        try { fs.unlinkSync(filePath); } catch (_) {}
+      }
+    }
+  }
+}
+
+/**
+ * Extrai a figurinha citada para o comando /unsticker, incluindo
+ * figurinhas sonoras encapsuladas em audioStickerMessage e wrappers externos.
+ */
+export function extractUnstickerSource(msg) {
+  if (!msg?.message || typeof msg.message !== 'object') return null;
+
+  const from = msg.key?.remoteJid;
+  const contextInfo = extractContextInfo(msg);
+  const quoted = contextInfo?.quotedMessage;
+  if (!quoted || typeof quoted !== 'object') return null;
+
+  const stickerObj =
+    unwrapAudioStickerMessage(quoted)?.stickerMessage ||
+    unwrapMessageContent(quoted).content?.stickerMessage;
+
+  if (!stickerObj) return null;
+
+  return {
+    stickerMessage: buildQuotedMessage(from, contextInfo, { stickerMessage: stickerObj }),
+    isAnimated: stickerObj.isAnimated === true
+  };
+}
+
+/**
+ * Baixa uma figurinha (comum ou audioStickerMessage), converte para GIF/MP4 ou PNG
+ * e limpa os temporários em bloco finally.
+ */
+export async function processUnsticker(
+  sock,
+  from,
+  msg,
+  source,
+  downloadFn = downloadWhatsAppMedia
+) {
+  const reply = async (text) => {
+    await sock.sendMessage(from, { text }, { quoted: msg });
+  };
+
+  if (!source?.stickerMessage) {
+    return reply(aviso('Responda a uma figurinha com /unsticker para transformá-la em imagem ou GIF/vídeo.'));
+  }
+
+  await reply('⏳ Convertendo figurinha, aguarde...');
+
+  let filePath = null;
+  let outPath = null;
+  try {
+    filePath = await downloadFn(source.stickerMessage, 'sticker');
+
+    if (source.isAnimated) {
+      try {
+        outPath = await convertWebpToMp4(filePath);
+        await sock.sendMessage(from, {
+          video: { url: outPath },
+          gifPlayback: true,
+          caption: '🎬 Figurinha animada convertida em GIF com sucesso!'
+        }, { quoted: msg });
+        return;
+      } catch (animErr) {
+        console.warn('⚠️ Falha ao converter sticker animado para MP4, tentando PNG:', animErr.message);
+        if (outPath && fs.existsSync(outPath)) {
+          try { fs.unlinkSync(outPath); } catch (_) {}
+          outPath = null;
+        }
+      }
+    }
+
+    outPath = await convertWebpToPng(filePath);
+    await sock.sendMessage(from, {
+      image: { url: outPath },
+      caption: '🖼️ Figurinha convertida com sucesso!'
+    }, { quoted: msg });
+  } catch (error) {
+    console.error('Erro ao converter figurinha:', error);
+    return reply(erro('Não consegui converter a figurinha.'));
+  } finally {
+    for (const p of [filePath, outPath]) {
+      if (p && fs.existsSync(p)) {
+        try { fs.unlinkSync(p); } catch (_) {}
+      }
+    }
+  }
+}
+
 export async function handleMediaCommands(sock, msg, command, args, sender, resolvedFrom = null) {
   const from = resolvedFrom || msg.key.remoteJid;
   const reply = async (text) => {
@@ -376,60 +671,15 @@ export async function handleMediaCommands(sock, msg, command, args, sender, reso
       break;
     }
 
+    case 'stickersom': {
+      const sources = extractSoundStickerSources(msg);
+      await processSoundStickerSources(sock, from, msg, sources);
+      break;
+    }
+
     case 'unsticker': {
-      const quoted = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
-      let stickerMessage = null;
-      let isAnimated = false;
-
-      if (quoted?.stickerMessage) {
-        stickerMessage = {
-          key: {
-            remoteJid: from,
-            id: msg.message.extendedTextMessage.contextInfo.stanzaId,
-            participant: msg.message.extendedTextMessage.contextInfo.participant
-          },
-          message: quoted
-        };
-        isAnimated = quoted.stickerMessage.isAnimated === true;
-      }
-
-      if (!stickerMessage) {
-        return reply(aviso('Responda a uma figurinha com /unsticker para transformá-la em imagem ou GIF/vídeo.'));
-      }
-
-      await reply('⏳ Convertendo figurinha, aguarde...');
-
-      try {
-        const filePath = await downloadWhatsAppMedia(stickerMessage, 'sticker');
-        
-        if (isAnimated) {
-          // Tenta converter WebP animado em MP4/GIF
-          try {
-            const mp4Path = await convertWebpToMp4(filePath);
-            await sock.sendMessage(from, { 
-              video: { url: mp4Path }, 
-              gifPlayback: true,
-              caption: '🎬 Figurinha animada convertida em GIF com sucesso!' 
-            }, { quoted: msg });
-            
-            try { fs.unlinkSync(filePath); } catch (_) {}
-            try { fs.unlinkSync(mp4Path); } catch (_) {}
-            return;
-          } catch (animErr) {
-            console.warn('⚠️ Falha ao converter sticker animado para MP4, tentando PNG:', animErr.message);
-          }
-        }
-
-        // Se for estático ou fallback para PNG
-        const pngPath = await convertWebpToPng(filePath);
-        await sock.sendMessage(from, { image: { url: pngPath }, caption: '🖼️ Figurinha convertida com sucesso!' }, { quoted: msg });
-        
-        try { fs.unlinkSync(filePath); } catch (_) {}
-        try { fs.unlinkSync(pngPath); } catch (_) {}
-      } catch (error) {
-        console.error('Erro ao converter figurinha:', error);
-        return reply(erro('Não consegui converter a figurinha.'));
-      }
+      const source = extractUnstickerSource(msg);
+      await processUnsticker(sock, from, msg, source);
       break;
     }
 

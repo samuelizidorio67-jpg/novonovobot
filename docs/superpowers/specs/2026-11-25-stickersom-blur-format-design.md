@@ -1,0 +1,13 @@
+# Design: `/stickersom` com fundo desfocado e cantos arredondados
+
+- **Intenção e motivo:** Melhorar o visual das figurinhas criadas pelo `/stickersom` em `src/utils/audioStickerMedia.js` (mantendo `/sticker`, `/sticker2` e `/sticker3` intactos), eliminando as faixas transparentes vazias em vídeos/imagens não quadrados sem cortar o conteúdo principal.
+- **Abordagens consideradas:**
+  1. **Quadrado preenchido com corte inteligente + cantos arredondados:** preenche `512×512` cortando as pontas (`crop`), mas perde topo/base em vídeos `9:16` ou laterais em `16:9`.
+  2. **Fundo desfocado preenchido + mídia inteira centralizada + cantos arredondados *(Escolhida)*:** usa o próprio vídeo/imagem ampliado e desfocado (`increase` + `crop` + `boxblur`) preenchendo o fundo `512×512`, sobrepõe a mídia original inteira sem cortes no centro (`decrease` + `overlay`) e aplica máscara alfa com cantos arredondados (`rx` proporcional a `34px` em `512×512`). Mantém 100% da cena visível com visual cheio no card do WhatsApp; trade-off é gerar frames um pouco mais ricos (mitigado pelos passes de compressão até `490000` bytes).
+  3. **Padrão cortado + `/stickersom inteiro` opcional:** evitada para não exigir subcomando extra mantendo faixas vazias no modo inteiro.
+- **Arquitetura e decisões:**
+  - Escopo restrito a `src/utils/audioStickerMedia.js` (`convertVideoToSoundStickerWebp` e `convertImageToSoundStickerWebp`) — sem alterar `src/commands/media.js` (`/sticker`, `/sticker2`, `/sticker3`) nem `src/utils/audioStickerProto.js`.
+  - Máscara de cantos arredondados gerada via `sharp` em arquivo temporário (escala de cinza `size×size`, `rx = Math.round((size * 34) / 512)`) e sempre removida em bloco `finally` para não vazar arquivos em `os.tmpdir()`.
+  - Em `convertVideoToSoundStickerWebp`, a máscara entra com `-loop 1` e `alphamerge=shortest=1` após `fps=${pass.fps}` e `overlay`, garantindo transparência apenas nos cantos sem truncar nem travar a duração do vídeo (respeitando `FFMPEG_TIMEOUT_MS = 60000` e `MAX_ANIMATED_WEBP_BYTES = 490000` nos passes `512` e fallback `384`).
+  - Em `convertImageToSoundStickerWebp`, aplica o mesmo fundo desfocado + sobreposição centralizada + máscara `512×512` respeitando `MAX_STATIC_WEBP_BYTES = 450 * 1024`.
+- **Verificação e entrega:** Atualizar `tests/test_audio_sticker.js` para validar com FFmpeg/Sharp reais que os WebPs gerados (vídeo `9:16`/landscape e imagem) mantêm `512×512`, animação intacta, cantos arredondados transparentes (`alpha = 0`), bordas laterais/verticais preenchidas (não transparentes) pelo blur e zero temporários vazados; em seguida rodar a suíte e atualizar no GitHub (`origin/main`).

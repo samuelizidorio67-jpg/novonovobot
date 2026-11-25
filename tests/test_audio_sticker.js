@@ -353,9 +353,37 @@ function assertIsWebpBuffer(buf, label) {
   assert.strictEqual(buf.subarray(8, 12).toString('ascii'), 'WEBP', `${label}: assinatura deve conter WEBP`);
 }
 
+const { default: sharp } = await import('sharp');
+
+async function assertRoundedBlurFormat(buf, label, { animated = false } = {}) {
+  const meta = await sharp(buf, { animated: true }).metadata();
+  const frameHeight = meta.pageHeight || meta.height;
+  assert.strictEqual(meta.width, 512, `${label}: largura esperada 512`);
+  assert.strictEqual(frameHeight, 512, `${label}: altura do quadro esperada 512`);
+  if (animated) {
+    assert((meta.pages || 1) > 1, `${label}: WebP animado deve preservar múltiplos quadros (obtido ${meta.pages})`);
+  }
+
+  const { data, info } = await sharp(buf, { page: 0 })
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  const alphaAt = (x, y) => data[(y * info.width + x) * info.channels + 3];
+
+  for (const [cx, cy] of [[0, 0], [511, 0], [0, 511], [511, 511]]) {
+    assert(alphaAt(cx, cy) < 20, `${label}: canto (${cx},${cy}) deve ser transparente (obtido alpha=${alphaAt(cx, cy)})`);
+  }
+
+  for (const [bx, by] of [[12, 256], [499, 256], [256, 12], [256, 499]]) {
+    assert(alphaAt(bx, by) >= 240, `${label}: borda (${bx},${by}) deve estar preenchida com blur opaco (obtido alpha=${alphaAt(bx, by)})`);
+  }
+}
+
 const tmpDir = os.tmpdir();
 const testSuffix = `${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
 const videoWithAudioPath = path.join(tmpDir, `test-stickersom-av-${testSuffix}.mp4`);
+const verticalVideoPath = path.join(tmpDir, `test-stickersom-vert-${testSuffix}.mp4`);
 const silentVideoPath = path.join(tmpDir, `test-stickersom-silent-${testSuffix}.mp4`);
 const audio12sPath = path.join(tmpDir, `test-stickersom-audio12s-${testSuffix}.mp3`);
 const imagePngPath = path.join(tmpDir, `test-stickersom-img-${testSuffix}.png`);
@@ -372,6 +400,14 @@ try {
     '-c:a', 'aac',
     '-shortest',
     videoWithAudioPath
+  ]);
+
+  // Gera vídeo vertical MP4 de 3 s (180x320, proporção 9:16)
+  await execFileAsync(ffmpegPath, [
+    '-y',
+    '-f', 'lavfi', '-i', 'color=c=purple:s=180x320:d=3',
+    '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+    verticalVideoPath
   ]);
 
   // Gera vídeo MP4 mudo de 3 s (320x240 sem áudio)
@@ -450,7 +486,7 @@ try {
     (err) => err instanceof Error && err.message.includes('NO_AUDIO_STREAM')
   );
 
-  // 4. convertVideoToSoundStickerWebp: WebP válido <= 490000 bytes (512x512 animado)
+  // 4. convertVideoToSoundStickerWebp: WebP válido <= 490000 bytes (512x512 animado, blur + cantos arredondados)
   const animWebp = await convertVideoToSoundStickerWebp(videoWithAudioPath, 5);
   assertIsWebpBuffer(animWebp, 'convertVideoToSoundStickerWebp');
   assert(animWebp.length <= 490000, `WebP animado deve ter <= 490000 bytes (obtido ${animWebp.length})`);
@@ -459,8 +495,14 @@ try {
     { width: 512, height: 512, isAnimated: true },
     'WebP animado gerado deve informar 512x512 e isAnimated=true'
   );
+  await assertRoundedBlurFormat(animWebp, 'convertVideoToSoundStickerWebp (4:3)', { animated: true });
 
-  // 5. convertImageToSoundStickerWebp: WebP válido <= 450*1024 bytes (512x512 estático)
+  const vertAnimWebp = await convertVideoToSoundStickerWebp(verticalVideoPath, 5);
+  assertIsWebpBuffer(vertAnimWebp, 'convertVideoToSoundStickerWebp (9:16)');
+  assert(vertAnimWebp.length <= 490000, `WebP vertical deve ter <= 490000 bytes (obtido ${vertAnimWebp.length})`);
+  await assertRoundedBlurFormat(vertAnimWebp, 'convertVideoToSoundStickerWebp (9:16)', { animated: true });
+
+  // 5. convertImageToSoundStickerWebp: WebP válido <= 450*1024 bytes (512x512 estático, blur + cantos arredondados)
   const staticWebp = await convertImageToSoundStickerWebp(imagePngPath);
   assertIsWebpBuffer(staticWebp, 'convertImageToSoundStickerWebp');
   assert(staticWebp.length <= 490000, `WebP estático deve ter <= 490000 bytes (obtido ${staticWebp.length})`);
@@ -468,6 +510,7 @@ try {
   assert.strictEqual(staticMeta.width, 512, 'WebP estático gerado deve ter largura 512');
   assert.strictEqual(staticMeta.height, 512, 'WebP estático gerado deve ter altura 512');
   assert.strictEqual(staticMeta.isAnimated, false, 'WebP estático gerado deve ter isAnimated=false');
+  await assertRoundedBlurFormat(staticWebp, 'convertImageToSoundStickerWebp (16:9)', { animated: false });
 
   // 6. Nenhum temporário vazado pelo processo atual
   const leaked = fs.readdirSync(tmpDir).filter((name) => name.startsWith('stickersom-') && name.includes(`-${process.pid}-`));
@@ -922,6 +965,7 @@ try {
 } finally {
   for (const filePath of [
     videoWithAudioPath,
+    verticalVideoPath,
     silentVideoPath,
     audio12sPath,
     imagePngPath,

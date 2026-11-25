@@ -1,4 +1,10 @@
 import assert from 'assert';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+import ffmpegPath from 'ffmpeg-static';
 import { proto } from '@whiskeysockets/baileys';
 import { queueManager } from '../src/queue/QueueManager.js';
 import {
@@ -6,6 +12,12 @@ import {
   unwrapAudioStickerMessage,
   sendAudioSticker
 } from '../src/utils/audioStickerProto.js';
+import {
+  probeMediaInfo,
+  extractOggOpusAudio,
+  convertVideoToSoundStickerWebp,
+  convertImageToSoundStickerWebp
+} from '../src/utils/audioStickerMedia.js';
 
 console.log('🧪 Iniciando testes do módulo audioStickerProto...');
 
@@ -266,3 +278,141 @@ try {
 }
 
 console.log('✅ Todos os testes de audioStickerProto passaram com sucesso!');
+
+console.log('🧪 Iniciando testes do módulo audioStickerMedia (FFmpeg)...');
+
+const execFileAsync = promisify(execFile);
+
+function assertIsWebpBuffer(buf, label) {
+  assert(Buffer.isBuffer(buf), `${label}: resultado deve ser Buffer`);
+  assert(buf.length > 12, `${label}: Buffer WebP deve ter mais que 12 bytes`);
+  assert.strictEqual(buf.subarray(0, 4).toString('ascii'), 'RIFF', `${label}: cabeçalho deve iniciar com RIFF`);
+  assert.strictEqual(buf.subarray(8, 12).toString('ascii'), 'WEBP', `${label}: assinatura deve conter WEBP`);
+}
+
+const tmpDir = os.tmpdir();
+const testSuffix = `${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+const videoWithAudioPath = path.join(tmpDir, `test-stickersom-av-${testSuffix}.mp4`);
+const silentVideoPath = path.join(tmpDir, `test-stickersom-silent-${testSuffix}.mp4`);
+const audio12sPath = path.join(tmpDir, `test-stickersom-audio12s-${testSuffix}.mp3`);
+const imagePngPath = path.join(tmpDir, `test-stickersom-img-${testSuffix}.png`);
+const probedOggPath = path.join(tmpDir, `test-stickersom-extracted-${testSuffix}.ogg`);
+const probedAudioOnlyOggPath = path.join(tmpDir, `test-stickersom-audioonly-${testSuffix}.ogg`);
+
+try {
+  // Gera vídeo MP4 de 7 s com vídeo (320x240) + áudio (440 Hz)
+  await execFileAsync(ffmpegPath, [
+    '-y',
+    '-f', 'lavfi', '-i', 'color=c=red:s=320x240:d=7',
+    '-f', 'lavfi', '-i', 'sine=f=440:d=7',
+    '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+    '-c:a', 'aac',
+    '-shortest',
+    videoWithAudioPath
+  ]);
+
+  // Gera vídeo MP4 mudo de 3 s (320x240 sem áudio)
+  await execFileAsync(ffmpegPath, [
+    '-y',
+    '-f', 'lavfi', '-i', 'color=c=blue:s=320x240:d=3',
+    '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+    silentVideoPath
+  ]);
+
+  // Gera áudio MP3 de 12 s para validar limite padrão de 10 s
+  await execFileAsync(ffmpegPath, [
+    '-y',
+    '-f', 'lavfi', '-i', 'sine=f=523:d=12',
+    '-c:a', 'libmp3lame',
+    audio12sPath
+  ]);
+
+  // Gera imagem PNG sintética (640x360) para testar proporção 512x512
+  await execFileAsync(ffmpegPath, [
+    '-y',
+    '-f', 'lavfi', '-i', 'color=c=green:s=640x360:d=1',
+    '-frames:v', '1',
+    imagePngPath
+  ]);
+
+  // 1. probeMediaInfo em vídeo com áudio (~7s), vídeo mudo (~3s) e áudio puro (~12s)
+  const avInfo = await probeMediaInfo(videoWithAudioPath);
+  assert.strictEqual(avInfo.hasVideo, true, 'Vídeo com áudio deve ter hasVideo=true');
+  assert.strictEqual(avInfo.hasAudio, true, 'Vídeo com áudio deve ter hasAudio=true');
+  assert(
+    avInfo.durationSeconds >= 6.5 && avInfo.durationSeconds <= 7.5,
+    `Duração esperada ~7s, obtida: ${avInfo.durationSeconds}`
+  );
+
+  const silentInfo = await probeMediaInfo(silentVideoPath);
+  assert.strictEqual(silentInfo.hasVideo, true, 'Vídeo mudo deve ter hasVideo=true');
+  assert.strictEqual(silentInfo.hasAudio, false, 'Vídeo mudo deve ter hasAudio=false');
+  assert(
+    silentInfo.durationSeconds >= 2.5 && silentInfo.durationSeconds <= 3.5,
+    `Duração esperada ~3s, obtida: ${silentInfo.durationSeconds}`
+  );
+
+  const audioOnlyInfo = await probeMediaInfo(audio12sPath);
+  assert.strictEqual(audioOnlyInfo.hasVideo, false, 'Áudio puro deve ter hasVideo=false');
+  assert.strictEqual(audioOnlyInfo.hasAudio, true, 'Áudio puro deve ter hasAudio=true');
+  assert(
+    audioOnlyInfo.durationSeconds >= 11.5 && audioOnlyInfo.durationSeconds <= 12.5,
+    `Duração esperada ~12s, obtida: ${audioOnlyInfo.durationSeconds}`
+  );
+
+  // 2. extractOggOpusAudio: vídeo com áudio limitado a 5s e áudio puro limitado ao padrão 10s
+  const oggBuffer = await extractOggOpusAudio(videoWithAudioPath, 5);
+  assert(Buffer.isBuffer(oggBuffer), 'extractOggOpusAudio deve retornar Buffer');
+  assert(oggBuffer.length > 0, 'extractOggOpusAudio deve retornar Buffer não vazio');
+  assert.strictEqual(oggBuffer.subarray(0, 4).toString('ascii'), 'OggS', 'Áudio extraído deve começar com OggS');
+
+  fs.writeFileSync(probedOggPath, oggBuffer);
+  const oggInfo = await probeMediaInfo(probedOggPath);
+  assert.strictEqual(oggInfo.hasAudio, true, 'OGG extraído deve possuir faixa de áudio');
+  assert.strictEqual(oggInfo.hasVideo, false, 'OGG extraído não deve possuir faixa de vídeo');
+  assert(oggInfo.durationSeconds <= 5.5, `OGG extraído deve respeitar limite de 5s (obtido ${oggInfo.durationSeconds})`);
+
+  const oggAudioOnly = await extractOggOpusAudio(audio12sPath);
+  assert.strictEqual(oggAudioOnly.subarray(0, 4).toString('ascii'), 'OggS');
+  fs.writeFileSync(probedAudioOnlyOggPath, oggAudioOnly);
+  const oggAudioOnlyInfo = await probeMediaInfo(probedAudioOnlyOggPath);
+  assert(
+    oggAudioOnlyInfo.durationSeconds >= 9.5 && oggAudioOnlyInfo.durationSeconds <= 10.5,
+    `OGG de áudio puro deve respeitar limite padrão de 10s (obtido ${oggAudioOnlyInfo.durationSeconds})`
+  );
+
+  // 3. extractOggOpusAudio em vídeo mudo deve rejeitar com NO_AUDIO_STREAM
+  await assert.rejects(
+    () => extractOggOpusAudio(silentVideoPath, 5),
+    (err) => err instanceof Error && err.message.includes('NO_AUDIO_STREAM')
+  );
+
+  // 4. convertVideoToSoundStickerWebp: WebP válido <= 490000 bytes
+  const animWebp = await convertVideoToSoundStickerWebp(videoWithAudioPath, 5);
+  assertIsWebpBuffer(animWebp, 'convertVideoToSoundStickerWebp');
+  assert(animWebp.length <= 490000, `WebP animado deve ter <= 490000 bytes (obtido ${animWebp.length})`);
+
+  // 5. convertImageToSoundStickerWebp: WebP válido <= 450*1024 bytes
+  const staticWebp = await convertImageToSoundStickerWebp(imagePngPath);
+  assertIsWebpBuffer(staticWebp, 'convertImageToSoundStickerWebp');
+  assert(staticWebp.length <= 490000, `WebP estático deve ter <= 490000 bytes (obtido ${staticWebp.length})`);
+
+  // 6. Nenhum temporário vazado pelo processo atual
+  const leaked = fs.readdirSync(tmpDir).filter((name) => name.startsWith('stickersom-') && name.includes(`-${process.pid}-`));
+  assert.deepStrictEqual(leaked, [], `Arquivos temporários vazados em os.tmpdir(): ${leaked.join(', ')}`);
+
+  console.log('✅ Todos os testes de audioStickerMedia passaram com sucesso!');
+} finally {
+  for (const filePath of [
+    videoWithAudioPath,
+    silentVideoPath,
+    audio12sPath,
+    imagePngPath,
+    probedOggPath,
+    probedAudioOnlyOggPath
+  ]) {
+    try {
+      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    } catch (_) {}
+  }
+}

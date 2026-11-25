@@ -10,7 +10,7 @@ import { getDatabase } from './database.js';
 import { getUser, updateUser, getGroupConfig } from './database/sqlite.js';
 import { formatUptime } from './utils/helpers.js';
 import { calculateBonusRewards } from './utils/bonusCalculator.js';
-import { buildMenu, buildLegendaMenu } from './config/menu.js';
+import { buildLegendaMenu, buildMenuCategoria, encontrarCategoriaMenu } from './config/menu.js';
 import { handleSeihaCommands } from './commands/seiha/index.js';
 import { activeSimulados, processSimuladoAnswer } from './commands/seiha/simulado.js';
 import { erroInterno } from './config/messages.js';
@@ -404,11 +404,6 @@ export async function handleMessages(rawSock, msg) {
     if (['menu', 'help', 'bot'].includes(command)) {
       const uptimeSeconds = (Date.now() - (global.botStartTime || Date.now())) / 1000;
       const uptimeStr = formatUptime(uptimeSeconds);
-
-      const timestamp = msg.messageTimestamp;
-      const latency = ((Date.now() - (timestamp * 1000)) / 1000).toFixed(3);
-      const velocityStr = latency < 0 ? '0.002' : latency;
-
       const userNumber = sender.split('@')[0];
 
       // Saudação baseada no horário de Brasília (UTC-3)
@@ -418,32 +413,26 @@ export async function handleMessages(rawSock, msg) {
       if (hour >= 5 && hour < 12) greeting = '🌅 Bom dia';
       else if (hour >= 12 && hour < 18) greeting = '☀️ Boa tarde';
 
-      // /menu completo: texto detalhado, com descrição de cada comando.
-      const querDetalhado = ['completo', 'detalhado', 'full', 'todos'].includes(
-        String(args[0] || '').toLowerCase()
-      );
-
-      if (querDetalhado) {
-        const menuText = buildMenu({
-          prefixo: prefix,
-          usuario: userNumber,
-          saudacao: greeting,
-          velocidade: velocityStr,
-          uptime: uptimeStr,
-        });
-
+      const enviarTexto = async (payload) => {
         try {
-          return await sock.sendMessage(from, { text: menuText, mentions: [sender] }, { quoted: msg });
+          return await sock.sendMessage(from, payload, { quoted: msg });
         } catch (_) {
-          return await sock.sendMessage(from, { text: menuText, mentions: [sender] });
+          return await sock.sendMessage(from, payload);
         }
+      };
+
+      // /menu <tema>: mostra todos os comandos da categoria escolhida, sem caixas ASCII.
+      const categoria = encontrarCategoriaMenu(args.join(' '));
+      if (categoria) {
+        return await enviarTexto({ text: buildMenuCategoria(categoria, { prefixo: prefix }) });
       }
 
-      // /menu: uma única mensagem — imagem sorteada com o menu na legenda.
+      // /menu: uma única mensagem — imagem sorteada com o menu limpo na legenda.
       const legenda = buildLegendaMenu({
         prefixo: prefix,
         usuario: userNumber,
         saudacao: greeting,
+        uptime: uptimeStr,
       });
 
       const menuImagePath = sortearImagemMenu();
@@ -462,11 +451,7 @@ export async function handleMessages(rawSock, msg) {
       }
 
       // Sem imagem ou falha no envio: a mesma legenda vai como texto.
-      try {
-        return await sock.sendMessage(from, { text: legenda, mentions: [sender] }, { quoted: msg });
-      } catch (_) {
-        return await sock.sendMessage(from, { text: legenda, mentions: [sender] });
-      }
+      return await enviarTexto({ text: legenda, mentions: [sender] });
     } else if (command === 'ia') {
       await handleIaCommand(sock, msg, args);
     }

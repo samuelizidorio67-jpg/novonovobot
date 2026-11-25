@@ -11,8 +11,12 @@ import { BOT_NAME } from './messages.js';
 
 export const CATEGORIAS = [
   {
+    id: 'midia',
+    tituloCurto: 'Mídia',
+    aliases: ['midia', 'mídia', 'media', 'downloads', 'sticker', 'stickers'],
     emoji: '📥',
     titulo: 'MÍDIA & DOWNLOADS',
+    destaques: ['play', 'video', 'tiktok', 'ig', 'sticker', 'stickersom', 'unsticker', 'ver'],
     comandos: [
       ['play <música ou link>', 'Baixar música do YouTube'],
       ['video <vídeo ou link>', 'Baixar vídeo do YouTube'],
@@ -29,15 +33,23 @@ export const CATEGORIAS = [
     ],
   },
   {
+    id: 'ia',
+    tituloCurto: 'IA',
+    aliases: ['ia', 'ai', 'inteligencia'],
     emoji: '🤖',
     titulo: 'INTELIGÊNCIA ARTIFICIAL',
+    destaques: ['ia'],
     comandos: [
       ['ia <pergunta>', 'Pesquisar na internet e responder, lembrando o fio da conversa'],
     ],
   },
   {
+    id: 'estudo',
+    tituloCurto: 'Estudo & Família',
+    aliases: ['estudo', 'estudos', 'familia', 'família', 'shiunji'],
     emoji: '🎓',
     titulo: 'ESTUDO & FAMÍLIA',
+    destaques: ['estudo', 'redacao', 'simulado', 'quiz anime', 'familia', 'rank', 'omiai', 'heranca'],
     comandos: [
       ['estudo <tema>', 'Explicar um assunto de escola ou curiosidade'],
       ['redacao <texto>', 'Corrigir redação no padrão ENEM'],
@@ -52,8 +64,12 @@ export const CATEGORIAS = [
     ],
   },
   {
+    id: 'rpg',
+    tituloCurto: 'RPG',
+    aliases: ['rpg', 'batalha', 'batalhas'],
     emoji: '⚔️',
     titulo: 'RPG & BATALHAS',
+    destaques: ['classe', 'missao', 'raid', 'curar', 'perfil'],
     comandos: [
       ['classe <guerreiro|mago|arqueiro>', 'Escolher a sua classe'],
       ['missao', 'Ver ou iniciar as missões do dia'],
@@ -63,8 +79,12 @@ export const CATEGORIAS = [
     ],
   },
   {
+    id: 'cassino',
+    tituloCurto: 'Cassino',
+    aliases: ['cassino', 'casino', 'minigames', 'jogos de aposta'],
     emoji: '🎰',
     titulo: 'CASSINO & MINIGAMES',
+    destaques: ['blackjack', 'poker', 'slots', 'pescar'],
     comandos: [
       ['blackjack <aposta>', 'Jogar 21 contra a banca'],
       ['poker <aposta>', 'Disputar uma mão rápida de poker'],
@@ -73,8 +93,12 @@ export const CATEGORIAS = [
     ],
   },
   {
+    id: 'social',
+    tituloCurto: 'Social',
+    aliases: ['social', 'casamento', 'casar'],
     emoji: '💍',
     titulo: 'CASAMENTO & SOCIAL',
+    destaques: ['casar', 'aceitar', 'rep', 'romance', 'beijo', 'tapa'],
     comandos: [
       ['casar @pessoa', 'Fazer um pedido de casamento'],
       ['aceitar', 'Aceitar o pedido pendente'],
@@ -90,8 +114,12 @@ export const CATEGORIAS = [
     ],
   },
   {
+    id: 'diversao',
+    tituloCurto: 'Diversão',
+    aliases: ['diversao', 'diversão', 'jogos', 'zueira'],
     emoji: '🎮',
     titulo: 'DIVERSÃO & JOGOS',
+    destaques: ['ship', '8ball', 'taro', 'quiz', 'forca', 'roleta', 'ppt'],
     comandos: [
       ['ship @pessoa1 @pessoa2', 'Calcular a afinidade do casal'],
       ['8ball <pergunta>', 'Perguntar à bola 8 mística'],
@@ -107,8 +135,12 @@ export const CATEGORIAS = [
     ],
   },
   {
+    id: 'admin',
+    tituloCurto: 'Admin',
+    aliases: ['admin', 'adm', 'administracao', 'administração', 'grupo'],
     emoji: '🛡️',
     titulo: 'ADMINISTRAÇÃO DO GRUPO',
+    destaques: ['ban', 'promote', 'tagall', 'mute', 'antilink', 'antispam', 'warn', 'enquete', 'adm'],
     comandos: [
       ['ban / kick @pessoa', 'Remover um membro do grupo'],
       ['promote @pessoa', 'Promover a administrador'],
@@ -129,8 +161,12 @@ export const CATEGORIAS = [
     ],
   },
   {
+    id: 'util',
+    tituloCurto: 'Utilidades',
+    aliases: ['util', 'utilidades', 'info', 'informacoes', 'informações'],
     emoji: '⚙️',
     titulo: 'UTILIDADES & INFORMAÇÕES',
+    destaques: ['qrcode', 'readqr', 'cep', 'lembrete', 'fila', 'ping', 'uptime', 'info', 'grupo'],
     comandos: [
       ['menu', 'Abrir este menu novamente'],
       ['qrcode <texto ou link>', 'Gerar a imagem de um QR Code'],
@@ -141,46 +177,99 @@ export const CATEGORIAS = [
       ['fila', 'Ver o status da fila de comandos'],
       ['ping', 'Medir o tempo de resposta'],
       ['uptime', 'Ver há quanto tempo o bot está online'],
-      ['info (ou /botinfo)', 'Ver informações técnicas do bot'],
+      ['info / botinfo', 'Ver informações técnicas do bot'],
       ['grupo', 'Ver os detalhes do grupo atual'],
     ],
   },
 ];
 
-/** Monta o menu completo. `prefixo` já entra em cada linha do comando. */
-export function buildMenu({
-  prefixo = '/',
+// Limite real da legenda de mídia no WhatsApp é 1.024. Trabalhamos com uma
+// folga para não esbarrar em diferenças de contagem de bytes.
+const LIMITE_LEGENDA = 1000;
+
+function normalizarTermo(texto) {
+  return String(texto ?? '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .trim();
+}
+
+/** Localiza uma categoria do menu por id, alias ou prefixo do título. */
+export function encontrarCategoriaMenu(termo) {
+  const alvo = normalizarTermo(termo);
+  if (!alvo) return null;
+
+  for (const categoria of CATEGORIAS) {
+    if (normalizarTermo(categoria.id) === alvo) return categoria;
+    if (
+      Array.isArray(categoria.aliases) &&
+      categoria.aliases.some((alias) => normalizarTermo(alias) === alvo)
+    ) {
+      return categoria;
+    }
+  }
+
+  if (alvo.length >= 3) {
+    for (const categoria of CATEGORIAS) {
+      if (
+        normalizarTermo(categoria.tituloCurto).startsWith(alvo) ||
+        normalizarTermo(categoria.titulo).startsWith(alvo)
+      ) {
+        return categoria;
+      }
+    }
+  }
+
+  return null;
+}
+
+/** Formata os comandos de uma única categoria com visual limpo (sem caixas ASCII). */
+export function buildMenuCategoria(categoria, { prefixo = '/' } = {}) {
+  if (!categoria || !Array.isArray(categoria.comandos)) return '';
+
+  const linhas = [`${categoria.emoji} *${categoria.titulo}*`, ''];
+  for (const [usoCmd, descricao] of categoria.comandos) {
+    linhas.push(`${prefixo}${usoCmd} — ${descricao}`);
+  }
+  return linhas.join('\n');
+}
+
+function buildCabecalhoMenu({
+  nome = BOT_NAME,
   usuario = '',
   saudacao = '👋 Olá',
-  velocidade = '0.003',
-  uptime = '0s',
-  ia = 'Qwen 3.8 27B (Groq)',
-  nome = BOT_NAME,
+  uptime = '',
+  incluirUptime = true,
+  incluirSaudacao = true,
 } = {}) {
-  const risco = '───────────────────────';
-  const linhas = [
-    `╭───「 ⚡ *${nome}* 」───`,
-    '│',
-    `│ ${saudacao}, *@${usuario}*!`,
-    '│',
-    `│ 👑 *Prefixo:* \`${prefixo}\``,
-    `│ ⚡ *Resposta:* *${velocidade}s*`,
-    `│ 🕒 *Online há:* *${uptime}*`,
-    `│ 🧠 *IA:* ${ia}`,
-    `╰${risco}`,
-  ];
+  const linhas = [`⚡ *${nome}*`];
+
+  if (incluirSaudacao && (saudacao || usuario)) {
+    const base = usuario
+      ? `${saudacao ? `${saudacao}, ` : ''}*@${usuario}*!`
+      : `${saudacao}!`;
+    const parteUptime = incluirUptime && uptime ? ` • Online: *${uptime}*` : '';
+    linhas.push(`${base}${parteUptime}`);
+  } else if (incluirUptime && uptime) {
+    linhas.push(`Online: *${uptime}*`);
+  }
+
+  return linhas;
+}
+
+/** Lista limpa com todas as categorias e descrições (sem bordas ASCII). */
+export function buildMenu(opcoes = {}) {
+  const prefixo = opcoes.prefixo || '/';
+  const linhas = buildCabecalhoMenu(opcoes);
 
   for (const categoria of CATEGORIAS) {
     linhas.push('');
-    linhas.push(`╭───「 ${categoria.emoji} *${categoria.titulo}* 」───`);
-    for (const [usoCmd, descricao] of categoria.comandos) {
-      linhas.push(`│ ◈ ${prefixo}${usoCmd} — ${descricao}`);
-    }
-    linhas.push(`╰${risco}`);
+    linhas.push(buildMenuCategoria(categoria, { prefixo }));
   }
 
   linhas.push('');
-  linhas.push('💡 *Dica:* rode um comando sem argumentos para ver um exemplo de uso.');
+  linhas.push('💡 Rode um comando sem argumentos para ver um exemplo de uso.');
   return linhas.join('\n');
 }
 
@@ -189,72 +278,43 @@ export function comandosDoMenu() {
   return CATEGORIAS.flatMap((c) => c.comandos.map(([usoCmd]) => usoCmd.split(' ')[0]));
 }
 
-// Limite real da legenda de mídia no WhatsApp é 1.024. Trabalhamos com uma
-// folga para não esbarrar em diferenças de contagem de bytes.
-const LIMITE_LEGENDA = 1000;
-
-// Títulos mais curtos para o menu que vai na legenda da imagem.
-const TITULOS_CURTOS = {
-  'MÍDIA & DOWNLOADS': 'MÍDIA',
-  'INTELIGÊNCIA ARTIFICIAL': 'IA',
-  'ESTUDO & FAMÍLIA': 'ESTUDO',
-  'RPG & BATALHAS': 'RPG',
-  'CASSINO & MINIGAMES': 'CASSINO',
-  'CASAMENTO & SOCIAL': 'SOCIAL',
-  'DIVERSÃO & JOGOS': 'DIVERSÃO',
-  'ADMINISTRAÇÃO DO GRUPO': 'ADMIN',
-  'UTILIDADES & INFORMAÇÕES': 'UTILIDADES'
-};
-
-/** Remove argumentos, menções e alternativas de uso: "ban / kick @pessoa" -> "ban / kick". */
-function comandoCompacto(uso) {
-  return String(uso)
-    .replace(/\s*[<(].*$/, '')
-    .replace(/\s*@.*$/, '')
-    .trim();
-}
-
-/**
- * Menu compacto para caber na legenda de uma imagem (limite de 1.024
- * caracteres do WhatsApp). Lista só os nomes dos comandos; as descrições
- * continuam disponíveis em `/menu completo`.
- */
-export function buildMenuCompacto({
-  prefixo = '/',
-  usuario = '',
-  saudacao = '👋 Olá',
-  nome = BOT_NAME,
-} = {}) {
-  const linhas = [`⚡ *${nome}*`];
-
-  if (usuario) linhas.push(`${saudacao}, *@${usuario}*!`);
-  linhas.push(`Prefixo: \`${prefixo}\``);
+function formatarLegenda(opcoes = {}) {
+  const prefixo = opcoes.prefixo || '/';
+  const linhas = buildCabecalhoMenu(opcoes);
 
   for (const categoria of CATEGORIAS) {
     linhas.push('');
-    linhas.push(`${categoria.emoji} *${TITULOS_CURTOS[categoria.titulo] || categoria.titulo}*`);
-    linhas.push(categoria.comandos.map(([usoCmd]) => comandoCompacto(usoCmd)).join(' · '));
+    linhas.push(`${categoria.emoji} *${categoria.tituloCurto}* — \`${prefixo}menu ${categoria.id}\``);
+    linhas.push(categoria.destaques.map((cmd) => `${prefixo}${cmd}`).join(', '));
   }
 
   linhas.push('');
-  linhas.push(`ℹ️ Descrições: \`${prefixo}menu completo\``);
-
+  linhas.push(`💡 Digite \`${prefixo}menu <tema>\` para ver todos os comandos e descrições.`);
   return linhas.join('\n');
 }
 
 /**
- * Garante que a legenda nunca passe do limite do WhatsApp. Se o texto base
- * já for grande (nome de usuário longo, categorias novas), remove a saudação
- * e, no pior caso, corta em uma quebra de linha e reanexa o aviso.
+ * Monta a legenda única do `/menu` dentro do limite de 1.024 caracteres
+ * do WhatsApp, com redução progressiva de cabeçalho e corte seguro no limite.
  */
 export function buildLegendaMenu(opcoes = {}) {
-  const texto = buildMenuCompacto(opcoes);
-  if (texto.length <= LIMITE_LEGENDA) return texto;
+  const completo = formatarLegenda(opcoes);
+  if (completo.length <= LIMITE_LEGENDA) return completo;
 
-  const semSaudacao = buildMenuCompacto({ ...opcoes, usuario: '', saudacao: '' });
-  if (semSaudacao.length <= LIMITE_LEGENDA) return semSaudacao;
+  const semUptime = formatarLegenda({ ...opcoes, incluirUptime: false });
+  if (semUptime.length <= LIMITE_LEGENDA) return semUptime;
 
-  const corte = semSaudacao.lastIndexOf('\n', LIMITE_LEGENDA - 1);
-  const corpo = semSaudacao.slice(0, corte > 0 ? corte : LIMITE_LEGENDA);
-  return `${corpo}\n\nℹ️ Menu completo: \`${opcoes.prefixo || '/'}menu completo\``;
+  const semCabecalho = formatarLegenda({
+    ...opcoes,
+    incluirUptime: false,
+    incluirSaudacao: false,
+  });
+  if (semCabecalho.length <= LIMITE_LEGENDA) return semCabecalho;
+
+  const prefixo = opcoes.prefixo || '/';
+  const rodape = `\n\n💡 Digite \`${prefixo}menu <tema>\` para ver todos os comandos e descrições.`;
+  const tetoCorpo = LIMITE_LEGENDA - rodape.length;
+  const corte = semCabecalho.lastIndexOf('\n', tetoCorpo);
+  const corpo = semCabecalho.slice(0, corte > 0 ? corte : Math.max(0, tetoCorpo));
+  return `${corpo}${rodape}`;
 }

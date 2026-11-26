@@ -2,6 +2,9 @@ import assert from 'assert';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+import ffmpegPath from 'ffmpeg-static';
 import {
   extractVideoId,
   normalizeCookiesToNetscape,
@@ -15,7 +18,11 @@ import {
   callTikWmApi,
   resetTikWmThrottleForTest,
   isTikTokPhotoSlideshow,
+  ensureWhatsAppCompatibleVideo,
+  INSTAGRAM_VIDEO_FORMAT,
 } from '../src/utils/helpers.js';
+
+const execFileAsync = promisify(execFile);
 
 console.log('🧪 Iniciando testes de YouTube, Instagram, TikTok e yt-dlp...');
 
@@ -205,6 +212,39 @@ console.log('🧪 Iniciando testes de YouTube, Instagram, TikTok e yt-dlp...');
     isTikTokPhotoSlideshow({ images: [], play: 'https://cdn/video.mp4', duration: 15 }),
     false
   );
+}
+
+// 8. Transcodificação segura de vídeo VP9 1440x2560 sem áudio (cenário do OOM no Instagram) + seletor de formato
+{
+  assert(INSTAGRAM_VIDEO_FORMAT.includes('width<=720'), 'Formato do Instagram deve limitar largura <= 720 antes de 1440p');
+  assert(INSTAGRAM_VIDEO_FORMAT.includes('+bestaudio/'), 'Formato do Instagram deve aceitar bestaudio sem exigir ext=m4a');
+
+  const tmpVp9 = path.join(os.tmpdir(), `test-vp9-1440-${Date.now()}.mp4`);
+  let outH264 = null;
+  try {
+    await execFileAsync(ffmpegPath, [
+      '-y', '-f', 'lavfi', '-i', 'color=c=black:s=1440x2560:r=10:d=1',
+      '-c:v', 'libvpx-vp9', '-b:v', '200k', tmpVp9,
+    ], { timeout: 30000 });
+
+    outH264 = await ensureWhatsAppCompatibleVideo(tmpVp9);
+    assert(fs.existsSync(outH264) && fs.statSync(outH264).size > 1000, 'Vídeo convertido deve existir');
+
+    let probeStderr = '';
+    try {
+      await execFileAsync(ffmpegPath, ['-i', outH264], { timeout: 10000 });
+    } catch (e) {
+      probeStderr = e.stderr || '';
+    }
+    assert(/Video:\s*h264/i.test(probeStderr), `Esperava codec h264 após conversão, veio: ${probeStderr.slice(0, 200)}`);
+    assert(/720x1280/.test(probeStderr), `Esperava escala 1440x2560 -> 720x1280, veio: ${probeStderr.slice(0, 200)}`);
+  } finally {
+    for (const f of [tmpVp9, outH264]) {
+      if (f && fs.existsSync(f)) {
+        try { fs.unlinkSync(f); } catch (_) {}
+      }
+    }
+  }
 }
 
 console.log('✅ Todos os testes de YouTube, Instagram, TikTok e yt-dlp passaram!');

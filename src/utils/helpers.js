@@ -1262,13 +1262,21 @@ async function downloadViaCobalt(info, kind = 'audio') {
 const MAX_WHATSAPP_VIDEO_BYTES = 95 * 1024 * 1024;
 const MAX_TRANSCODE_INPUT_BYTES = 45 * 1024 * 1024;
 
-function probeVideoCodec(inputPath) {
+export const INSTAGRAM_VIDEO_FORMAT = 'best[vcodec^=h264][ext=mp4][height<=1280]/best[vcodec^=avc1][ext=mp4][height<=1280]/best[ext=mp4][height<=1280]/bestvideo[width<=720][vcodec^=avc1]+bestaudio/bestvideo[width<=720]+bestaudio/bestvideo[height<=1280]+bestaudio/best[ext=mp4]/bestvideo+bestaudio/best';
+
+function probeVideoInfo(inputPath) {
   const bin = fs.existsSync('/usr/bin/ffmpeg') ? '/usr/bin/ffmpeg' : (ffmpegPath || 'ffmpeg');
   return new Promise((resolve) => {
     execFile(bin, ['-i', inputPath], { timeout: 10000 }, (_err, _stdout, stderr) => {
       const out = String(stderr || '');
-      const m = out.match(/Stream #\d+:\d+.*:\s*Video:\s*([a-zA-Z0-9_]+)/);
-      resolve(m ? m[1].toLowerCase() : null);
+      const vm = out.match(/Stream #\d+:\d+.*:\s*Video:\s*([a-zA-Z0-9_]+).*?(\d{2,5})x(\d{2,5})/);
+      const hasAudio = /Stream #\d+:\d+.*:\s*Audio:/.test(out);
+      resolve({
+        codec: vm ? vm[1].toLowerCase() : null,
+        width: vm ? Number(vm[2]) : 0,
+        height: vm ? Number(vm[3]) : 0,
+        hasAudio,
+      });
     });
   });
 }
@@ -1288,10 +1296,11 @@ async function finalizeWhatsappVideo(filePath) {
     throw new Error(`Vídeo excede o limite de envio do WhatsApp (${mb} MB)`);
   }
 
-  const codec = await probeVideoCodec(filePath);
-  if (codec && codec !== 'h264' && size <= MAX_TRANSCODE_INPUT_BYTES) {
-    console.log(`[video] 🔄 Convertendo codec ${codec} para H.264 compatível com WhatsApp...`);
-    return await ensureWhatsAppCompatibleVideo(filePath);
+  const info = await probeVideoInfo(filePath);
+  const needsTranscode = (info.codec && info.codec !== 'h264') || info.width > 1280 || info.height > 1280;
+  if (needsTranscode && size <= MAX_TRANSCODE_INPUT_BYTES) {
+    console.log(`[video] 🔄 Convertendo ${info.codec || 'video'} (${info.width}x${info.height}) para H.264 compatível com WhatsApp...`);
+    return await ensureWhatsAppCompatibleVideo(filePath, info);
   }
   return filePath;
 }
@@ -1587,31 +1596,47 @@ export async function downloadTiktokAudio(url) {
   }
 }
 
-// Garante que o vídeo seja codificado em H.264 + AAC + yuv420p com +faststart para reproduzir perfeitamente no WhatsApp
-export async function ensureWhatsAppCompatibleVideo(inputPath) {
+// Garante que o vídeo seja codificado em H.264 + AAC + yuv420p (<= 720p, baixo uso de RAM) com +faststart
+export async function ensureWhatsAppCompatibleVideo(inputPath, mediaInfo = null) {
+  const info = mediaInfo || await probeVideoInfo(inputPath);
   const outputPath = path.join(os.tmpdir(), `wa-compat-${Date.now()}.mp4`);
   const bin = (fs.existsSync('/usr/bin/ffmpeg') ? '/usr/bin/ffmpeg' : (ffmpegPath || 'ffmpeg'));
 
-  return new Promise((resolve) => {
+  const args = [
+    '-y',
+    '-threads', '2',
+    '-i', inputPath,
+    '-vf', "scale='if(gt(iw,ih),min(1280,iw),min(720,iw))':-2,scale=trunc(iw/2)*2:trunc(ih/2)*2",
+    '-c:v', 'libx264',
+    '-preset', 'superfast',
+    '-crf', '24',
+    '-pix_fmt', 'yuv420p',
+    '-x264-params', 'threads=2:lookahead-threads=1',
+  ];
+
+  if (info.hasAudio !== false) {
+    args.push('-c:a', 'aac', '-b:a', '128k');
+  } else {
+    args.push('-an');
+  }
+  args.push('-movflags', '+faststart', outputPath);
+
+  return new Promise((resolve, reject) => {
     execFile(
       bin,
-      [
-        '-y',
-        '-i', inputPath,
-        '-c:v', 'libx264',
-        '-preset', 'veryfast',
-        '-crf', '24',
-        '-pix_fmt', 'yuv420p',
-        '-c:a', 'aac',
-        '-b:a', '128k',
-        '-movflags', '+faststart',
-        outputPath
-      ],
-      { timeout: 90000 },
+      args,
+      { timeout: 90000, maxBuffer: 10 * 1024 * 1024 },
       (error) => {
         if (error) {
-          console.warn('⚠️ Transcodificação para WhatsApp ignorada/falhou, usando vídeo original:', error.message);
-          return resolve(inputPath);
+          if (fs.existsSync(outputPath)) {
+            try { fs.unlinkSync(outputPath); } catch (_) {}
+          }
+          if (!info.codec || info.codec === 'h264') {
+            console.warn('⚠️ Transcodificação para WhatsApp ignorada/falhou, usando vídeo H.264 original:', error.message?.slice(0, 150));
+            return resolve(inputPath);
+          }
+          try { fs.unlinkSync(inputPath); } catch (_) {}
+          return reject(new Error(`Falha ao converter vídeo (${info.codec}) para H.264 compatível com WhatsApp`));
         }
         try {
           if (fs.existsSync(outputPath) && fs.statSync(outputPath).size > 1000) {
@@ -1679,7 +1704,7 @@ async function downloadInstagramMedia(url, kind = 'video') {
   const tmpFile = path.join(os.tmpdir(), isAudio ? `ig-audio-${Date.now()}.mp3` : `ig-raw-${Date.now()}.mp4`);
   const mediaArgs = isAudio
     ? ['--extract-audio', '--audio-format', 'mp3', '--audio-quality', '0', '--output', tmpFile]
-    : ['--format', 'best[vcodec^=h264][ext=mp4]/best[vcodec^=avc1][ext=mp4]/best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best', '--merge-output-format', 'mp4', '--output', tmpFile];
+    : ['--format', INSTAGRAM_VIDEO_FORMAT, '--merge-output-format', 'mp4', '--output', tmpFile];
 
   const hasIgCookies = checkValidInstagramCookies();
   const attempts = buildInstagramYtDlpAttempts(hasIgCookies);

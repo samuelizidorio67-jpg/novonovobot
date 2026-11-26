@@ -546,6 +546,11 @@ export async function processUnsticker(
   }
 }
 
+function extractFirstUrl(text = '') {
+  const m = String(text || '').match(/https?:\/\/[^\s<>]+/i);
+  return m ? m[0].replace(/[),.;!?]+$/, '') : String(text || '').trim();
+}
+
 export async function handleMediaCommands(sock, msg, command, args, sender, resolvedFrom = null) {
   const from = resolvedFrom || msg.key.remoteJid;
   const reply = async (text) => {
@@ -768,16 +773,17 @@ export async function handleMediaCommands(sock, msg, command, args, sender, reso
         return reply(uso('/play Linkin Park Numb', 'Digite o nome da música ou o link do YouTube, TikTok ou Instagram.'));
       }
 
-      if (/(tiktok\.com|vt\.tiktok|vm\.tiktok)/i.test(query)) {
+      if (/(tiktok\.com|tiktokv\.com)/i.test(query)) {
+        const tiktokUrl = extractFirstUrl(query);
         await reply('⏳ Baixando áudio do TikTok, aguarde...');
         let music;
         try {
-          music = await downloadTiktokAudio(query);
+          music = await downloadTiktokAudio(tiktokUrl);
           await sendAudioCompat(sock, from, music.filePath, music.title, msg);
           return;
         } catch (error) {
           console.error('Erro ao baixar áudio do TikTok via /play:', error);
-          const detail = error?.message ? ` (${error.message.slice(0, 120)})` : '';
+          const detail = error?.message ? ` (${error.message.slice(0, 140)})` : '';
           return reply(erro(`Não consegui baixar o áudio do TikTok${detail}.`));
         } finally {
           if (music?.filePath && fs.existsSync(music.filePath)) {
@@ -787,15 +793,17 @@ export async function handleMediaCommands(sock, msg, command, args, sender, reso
       }
 
       if (/(instagram\.com|instagr\.am)/i.test(query)) {
+        const igUrl = extractFirstUrl(query);
         await reply('⏳ Baixando áudio do Instagram, aguarde...');
         let music;
         try {
-          music = await downloadInstagramAudio(query);
+          music = await downloadInstagramAudio(igUrl);
           await sendAudioCompat(sock, from, music.filePath, music.title, msg);
           return;
         } catch (error) {
           console.error('Erro ao baixar áudio do Instagram via /play:', error);
-          return reply(erro('Não consegui baixar o áudio do Instagram. Verifique se a publicação é pública.'));
+          const detail = error?.message ? ` (${error.message.slice(0, 140)})` : '';
+          return reply(erro(`Não consegui baixar o áudio do Instagram${detail}.`));
         } finally {
           if (music?.filePath && fs.existsSync(music.filePath)) {
             try { fs.unlinkSync(music.filePath); } catch (_) {}
@@ -812,7 +820,7 @@ export async function handleMediaCommands(sock, msg, command, args, sender, reso
         await sendAudioCompat(sock, from, music.filePath, music.title, msg);
       } catch (error) {
         console.error('Erro ao baixar música:', error);
-        const detail = error?.message ? ` (${error.message.slice(0, 100)})` : '';
+        const detail = error?.message ? ` (${error.message.slice(0, 140)})` : '';
         return reply(erro(`Não consegui buscar ou baixar a música${detail}. Tente novamente em instantes.`));
       } finally {
         if (music?.filePath && fs.existsSync(music.filePath)) {
@@ -823,73 +831,88 @@ export async function handleMediaCommands(sock, msg, command, args, sender, reso
     }
 
     case 'video': {
-      const query = args.join(' ');
+      const query = args.join(' ').trim();
       if (!query) {
         return reply(uso('/video Minecraft Speedrun', 'Digite o nome do vídeo ou o link do YouTube, TikTok ou Instagram.'));
       }
 
-      if (/tiktok\.com/i.test(query)) {
+      if (/(tiktok\.com|tiktokv\.com)/i.test(query)) {
+        const tiktokUrl = extractFirstUrl(query);
         await reply('⏳ Baixando vídeo do TikTok sem marca d\'água, aguarde...');
+        let video;
         try {
-          const video = await downloadTiktokVideo(query);
+          video = await downloadTiktokVideo(tiktokUrl);
           await sock.sendMessage(
-            from, 
-            { 
-              video: { url: video.filePath }, 
+            from,
+            {
+              video: { url: video.filePath },
+              mimetype: 'video/mp4',
               caption: `🎥 *${video.title}*\n\nCriador: ${video.author}`
-            }, 
+            },
             { quoted: msg }
           );
-          fs.unlinkSync(video.filePath);
           return;
         } catch (error) {
           console.error('Erro ao baixar vídeo do TikTok via /video:', error);
-          const detail = error?.message ? ` (${error.message.slice(0, 120)})` : '';
-          return reply(erro(`Não consegui baixar o vídeo do TikTok${detail}. Verifique se o link é público e tente novamente.`));
+          const detail = error?.message ? ` (${error.message.slice(0, 140)})` : '';
+          return reply(erro(`Não consegui baixar o vídeo do TikTok${detail}.`));
+        } finally {
+          if (video?.filePath && fs.existsSync(video.filePath)) {
+            try { fs.unlinkSync(video.filePath); } catch (_) {}
+          }
         }
       }
 
-      if (/instagram\.com/i.test(query)) {
+      if (/(instagram\.com|instagr\.am)/i.test(query)) {
+        const igUrl = extractFirstUrl(query);
         await reply('⏳ Baixando vídeo do Instagram, aguarde...');
+        let video;
         try {
-          const video = await downloadInstagramVideo(query);
+          video = await downloadInstagramVideo(igUrl);
           await sock.sendMessage(
-            from, 
-            { 
-              video: { url: video.filePath }, 
+            from,
+            {
+              video: { url: video.filePath },
               mimetype: 'video/mp4',
               caption: `🎥 *${video.title}*\n\nOrigem: Instagram`
-            }, 
+            },
             { quoted: msg }
           );
-          fs.unlinkSync(video.filePath);
           return;
         } catch (error) {
           console.error('Erro ao baixar vídeo do Instagram via /video:', error);
-          return reply(erro('Não consegui baixar o vídeo do Instagram. Verifique se a publicação é pública.'));
+          const detail = error?.message ? ` (${error.message.slice(0, 140)})` : '';
+          return reply(erro(`Não consegui baixar o vídeo do Instagram${detail}.`));
+        } finally {
+          if (video?.filePath && fs.existsSync(video.filePath)) {
+            try { fs.unlinkSync(video.filePath); } catch (_) {}
+          }
         }
       }
 
       await reply('⏳ Buscando e baixando vídeo do YouTube, aguarde...');
 
+      let video;
       try {
-        const video = await downloadYoutubeVideo(query);
+        video = await downloadYoutubeVideo(query);
 
         await sock.sendMessage(
-          from, 
-          { 
-            video: { url: video.filePath }, 
-            caption: `🎥 *${video.title}*\n\nCanal: ${video.author}\nVisualizações: ${video.views.toLocaleString()}`
-          }, 
+          from,
+          {
+            video: { url: video.filePath },
+            mimetype: 'video/mp4',
+            caption: `🎥 *${video.title}*\n\nCanal: ${video.author}\nVisualizações: ${(video.views || 0).toLocaleString()}`
+          },
           { quoted: msg }
         );
-
-        // Limpa temporários
-        fs.unlinkSync(video.filePath);
       } catch (error) {
         console.error('Erro ao baixar vídeo:', error);
-        const detail = error?.message ? ` (${error.message.slice(0, 100)})` : '';
-        return reply(erro(`Não consegui buscar ou baixar o vídeo${detail}. O vídeo pode ser muito grande ou indisponível.`));
+        const detail = error?.message ? ` (${error.message.slice(0, 140)})` : '';
+        return reply(erro(`Não consegui buscar ou baixar o vídeo${detail}.`));
+      } finally {
+        if (video?.filePath && fs.existsSync(video.filePath)) {
+          try { fs.unlinkSync(video.filePath); } catch (_) {}
+        }
       }
       break;
     }
@@ -898,28 +921,34 @@ export async function handleMediaCommands(sock, msg, command, args, sender, reso
     case 'insta':
     case 'igvideo':
     case 'instavideo': {
-      const url = args[0];
-      if (!url || !/instagram\.com/i.test(url)) {
+      const rawInput = args.join(' ').trim();
+      const url = extractFirstUrl(rawInput);
+      if (!url || !/(instagram\.com|instagr\.am)/i.test(url)) {
         return reply(uso('/ig https://www.instagram.com/reel/...', 'Cole um link válido do Instagram.'));
       }
 
       await reply('⏳ Baixando vídeo do Instagram, aguarde...');
 
+      let video;
       try {
-        const video = await downloadInstagramVideo(url);
+        video = await downloadInstagramVideo(url);
         await sock.sendMessage(
-          from, 
-          { 
-            video: { url: video.filePath }, 
+          from,
+          {
+            video: { url: video.filePath },
             mimetype: 'video/mp4',
             caption: `🎥 *${video.title}*\n\nOrigem: Instagram`
-          }, 
+          },
           { quoted: msg }
         );
-        fs.unlinkSync(video.filePath);
       } catch (error) {
         console.error('Erro ao baixar vídeo do Instagram:', error);
-        return reply(erro('Não consegui baixar o vídeo do Instagram. Verifique o link e tente novamente.'));
+        const detail = error?.message ? ` (${error.message.slice(0, 140)})` : '';
+        return reply(erro(`Não consegui baixar o vídeo do Instagram${detail}.`));
+      } finally {
+        if (video?.filePath && fs.existsSync(video.filePath)) {
+          try { fs.unlinkSync(video.filePath); } catch (_) {}
+        }
       }
       break;
     }
@@ -927,69 +956,86 @@ export async function handleMediaCommands(sock, msg, command, args, sender, reso
     case 'igaudio':
     case 'instaaudio':
     case 'igplay': {
-      const url = args[0];
-      if (!url || !/instagram\.com/i.test(url)) {
+      const rawInput = args.join(' ').trim();
+      const url = extractFirstUrl(rawInput);
+      if (!url || !/(instagram\.com|instagr\.am)/i.test(url)) {
         return reply(uso('/igaudio https://www.instagram.com/reel/...', 'Cole um link válido do Instagram.'));
       }
 
       await reply('⏳ Baixando áudio do Instagram, aguarde...');
 
+      let music;
       try {
-        const music = await downloadInstagramAudio(url);
+        music = await downloadInstagramAudio(url);
         await sendAudioCompat(sock, from, music.filePath, music.title, msg);
-        fs.unlinkSync(music.filePath);
       } catch (error) {
         console.error('Erro ao baixar áudio do Instagram:', error);
-        return reply(erro('Não consegui baixar o áudio do Instagram. Verifique o link e tente novamente.'));
+        const detail = error?.message ? ` (${error.message.slice(0, 140)})` : '';
+        return reply(erro(`Não consegui baixar o áudio do Instagram${detail}.`));
+      } finally {
+        if (music?.filePath && fs.existsSync(music.filePath)) {
+          try { fs.unlinkSync(music.filePath); } catch (_) {}
+        }
       }
       break;
     }
 
     case 'tiktok':
     case 'ttvideo': {
-      const url = args[0];
-      if (!url || !/tiktok\.com/i.test(url)) {
+      const rawInput = args.join(' ').trim();
+      const url = extractFirstUrl(rawInput);
+      if (!url || !/(tiktok\.com|tiktokv\.com)/i.test(url)) {
         return reply(uso('/tiktok https://vm.tiktok.com/...', 'Cole um link válido do TikTok.'));
       }
 
       await reply('⏳ Baixando vídeo do TikTok sem marca d\'água, aguarde...');
 
+      let video;
       try {
-        const video = await downloadTiktokVideo(url);
+        video = await downloadTiktokVideo(url);
         await sock.sendMessage(
-          from, 
-          { 
-            video: { url: video.filePath }, 
+          from,
+          {
+            video: { url: video.filePath },
+            mimetype: 'video/mp4',
             caption: `🎥 *${video.title}*\n\nCriador: ${video.author}`
-          }, 
+          },
           { quoted: msg }
         );
-        fs.unlinkSync(video.filePath);
       } catch (error) {
         console.error('Erro ao baixar vídeo do TikTok:', error);
-        const detail = error?.message ? ` (${error.message.slice(0, 120)})` : '';
-        return reply(erro(`Não consegui baixar o vídeo do TikTok${detail}. Verifique o link e tente novamente.`));
+        const detail = error?.message ? ` (${error.message.slice(0, 140)})` : '';
+        return reply(erro(`Não consegui baixar o vídeo do TikTok${detail}.`));
+      } finally {
+        if (video?.filePath && fs.existsSync(video.filePath)) {
+          try { fs.unlinkSync(video.filePath); } catch (_) {}
+        }
       }
       break;
     }
 
     case 'tiktokaudio':
     case 'ttplay': {
-      const url = args[0];
-      if (!url || !/tiktok\.com/i.test(url)) {
+      const rawInput = args.join(' ').trim();
+      const url = extractFirstUrl(rawInput);
+      if (!url || !/(tiktok\.com|tiktokv\.com)/i.test(url)) {
         return reply(uso('/tiktokaudio https://vm.tiktok.com/...', 'Cole um link válido do TikTok.'));
       }
 
       await reply('⏳ Baixando áudio do TikTok, aguarde...');
 
+      let music;
       try {
-        const music = await downloadTiktokAudio(url);
+        music = await downloadTiktokAudio(url);
         await sendAudioCompat(sock, from, music.filePath, music.title, msg);
-        fs.unlinkSync(music.filePath);
       } catch (error) {
         console.error('Erro ao baixar áudio do TikTok:', error);
-        const detail = error?.message ? ` (${error.message.slice(0, 120)})` : '';
-        return reply(erro(`Não consegui baixar o áudio do TikTok${detail}. Verifique o link e tente novamente.`));
+        const detail = error?.message ? ` (${error.message.slice(0, 140)})` : '';
+        return reply(erro(`Não consegui baixar o áudio do TikTok${detail}.`));
+      } finally {
+        if (music?.filePath && fs.existsSync(music.filePath)) {
+          try { fs.unlinkSync(music.filePath); } catch (_) {}
+        }
       }
       break;
     }

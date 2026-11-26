@@ -17,4 +17,5 @@ ia_history.json
 backups/
 *cookies.txt
 database.json
+.bin/
 

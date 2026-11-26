@@ -15,13 +15,14 @@ RUN curl -fsSL https://deno.land/install.sh | sh
 ENV DENO_INSTALL="/root/.deno"
 ENV PATH="$DENO_INSTALL/bin:$PATH"
 
-# Instala a versão oficial mais recente do yt-dlp diretamente do GitHub
-RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && chmod a+rx /usr/local/bin/yt-dlp
+# Instala a versão oficial standalone mais recente do yt-dlp (inclui curl_cffi para Instagram/TikTok)
+RUN arch="$(uname -m)" && \
+    case "$arch" in aarch64|arm64) asset="yt-dlp_linux_aarch64" ;; *) asset="yt-dlp_linux" ;; esac && \
+    curl -fsSL "https://github.com/yt-dlp/yt-dlp/releases/latest/download/${asset}" -o /usr/local/bin/yt-dlp && \
+    chmod a+rx /usr/local/bin/yt-dlp
 
-# Plugin de PO Token (em 2026 o YouTube exige Proof-of-Origin em vários
-# clientes; sem ele o erro "Sign in to confirm you're not a bot" persiste
-# mesmo com cookies). Falha de rede aqui não quebra o build.
-RUN pip3 install --no-cache-dir --break-system-packages bgutil-ytdlp-pot-provider || pip3 install --no-cache-dir bgutil-ytdlp-pot-provider || true
+# Plugin de PO Token + curl_cffi caso yt-dlp Python seja invocado
+RUN pip3 install --no-cache-dir --break-system-packages curl_cffi bgutil-ytdlp-pot-provider || pip3 install --no-cache-dir curl_cffi bgutil-ytdlp-pot-provider || true
 
 WORKDIR /app
 

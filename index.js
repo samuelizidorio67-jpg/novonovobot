@@ -9,6 +9,7 @@ import { loadDatabase } from './src/database.js';
 import { initSqlite } from './src/database/sqlite.js';
 import { ensureDataDir, SESSION_DIR, IS_PERSISTENT, DATA_DIR } from './src/config/paths.js';
 import { criarCacheDeTentativas, instalarFiltroDeRuidoDeSessao, criarRegistradorDeFalhas } from './src/utils/sessionTools.js';
+import { ensureLatestYtDlp } from './src/utils/helpers.js';
 import { recordIncomingViewOnce, recordUnavailableViewOnce } from './src/utils/viewOnceManager.js';
 import { handleMessages } from './src/messageHandler.js';
 import { startReminderScheduler } from './src/commands/seiha/lembrete.js';
@@ -66,6 +67,7 @@ async function startBot() {
   // banco entre deploys; sem volume, comporta-se como antes)
   ensureDataDir();
   if (IS_PERSISTENT) console.log(`💾 Persistência em volume: ${DATA_DIR}`);
+  ensureLatestYtDlp().catch(() => {});
 
   // Carrega banco de dados local centralizado
   await loadDatabase();

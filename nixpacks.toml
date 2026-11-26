@@ -2,7 +2,7 @@
 nixPkgs = ["nodejs_20", "ffmpeg", "python3", "deno", "yt-dlp"]
 
 [phases.install]
-cmds = ["npm install", "pip3 install --no-cache-dir -U yt-dlp bgutil-ytdlp-pot-provider || true"]
+cmds = ["npm install", "pip3 install --no-cache-dir --break-system-packages -U yt-dlp curl_cffi bgutil-ytdlp-pot-provider || pip3 install --no-cache-dir -U yt-dlp curl_cffi bgutil-ytdlp-pot-provider || true"]
 
 [start]
 cmd = "node index.js"

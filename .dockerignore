@@ -9,3 +9,4 @@ scratch
 fly.toml
 flyctl.zip
 flyctl-bin
+.bin
